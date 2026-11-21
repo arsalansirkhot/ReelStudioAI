@@ -1,5 +1,5 @@
 # Reel Studio AI updater: downloads the latest app code from GitHub.
-# Needs no Git install. Only code files are replaced; projects, videos and
+# Needs no Git install or key (public repository). Only code files are replaced; projects, videos and
 # settings are never touched. Any failure just starts the current version.
 
 $ErrorActionPreference = 'Stop'
@@ -12,21 +12,16 @@ $VersionFile = Join-Path $AppDir 'installed_version.txt'
 $Files = @('app.py', 'requirements.txt', 'README.txt', 'update.ps1', '.streamlit/config.toml')
 
 try {
-    if (-not (Test-Path $TokenFile)) {
-        Write-Host ''
-        Write-Host 'To get automatic updates, paste your GitHub read-only key below.'
-        $key = Read-Host 'GitHub key (or just press Enter to skip)'
-        if ([string]::IsNullOrWhiteSpace($key)) { Write-Host 'Skipping update check.'; exit 0 }
-        Set-Content -Path $TokenFile -Value $key.Trim() -NoNewline
-        Write-Host 'Key saved.'
-    }
-    $token = (Get-Content $TokenFile -Raw).Trim()
-
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $headers = @{
-        Authorization          = "Bearer $token"
         'User-Agent'           = 'ReelStudioAI-updater'
         'X-GitHub-Api-Version' = '2022-11-28'
+    }
+    # The repository is public, so no key is needed. A key in github_token.txt
+    # is still used if present (needed only if the repository is made private).
+    if (Test-Path $TokenFile) {
+        $token = (Get-Content $TokenFile -Raw).Trim()
+        if ($token) { $headers['Authorization'] = "Bearer $token" }
     }
 
     $sha = (Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/commits/$Branch" -Headers $headers -TimeoutSec 20).sha
@@ -66,7 +61,7 @@ try {
 catch {
     $msg = $_.Exception.Message
     if ($msg -match '401|403|404') {
-        Write-Host 'GitHub refused the key. Delete github_token.txt and paste a new key next time.'
+        Write-Host 'GitHub refused the request. If the repository is private, put a valid read-only key in github_token.txt.'
     } else {
         Write-Host "Could not check for updates ($msg)."
     }
