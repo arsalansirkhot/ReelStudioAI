@@ -2,6 +2,23 @@
 setlocal
 cd /d "%~dp0"
 
+rem Download the latest app code from GitHub (skipped when restarting after a launcher update)
+if /i not "%~1"=="noupdate" (
+  echo Checking for app updates...
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0update.ps1"
+)
+
+rem If the update brought a new launcher, swap it in and restart with it
+if exist "run_windows.bat.new" (
+  fc /b "run_windows.bat.new" "run_windows.bat" >nul 2>nul
+  if errorlevel 1 (
+    move /y "run_windows.bat.new" "run_windows.bat" >nul
+    call "%~f0" noupdate
+    exit /b
+  )
+  del "run_windows.bat.new"
+)
+
 where py >nul 2>nul
 if errorlevel 1 (
   echo Python launcher not found. Install Python 3.11 from https://www.python.org/downloads/
