@@ -1,0 +1,13 @@
+# Local data and secrets: never upload these
+.venv/
+__pycache__/
+projects/
+reference_videos/
+fonts_cache/
+fonts_export/
+sfx/
+settings.json
+my_style.json
+github_token.txt
+installed_version.txt
+run_windows.bat.new
