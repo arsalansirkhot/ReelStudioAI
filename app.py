@@ -647,6 +647,48 @@ def installed_fonts(refresh_token=0):
     return index
 
 
+def _font_em_ratio(path):
+    """CSS em size of one ASS font-size unit for this font file: libass sizes text by the OS/2 win metrics."""
+    with open(path, "rb") as f:
+        head = f.read(12)
+        off = 0
+        if head[:4] == b"ttcf":
+            off = struct.unpack(">I", f.read(4))[0]
+        f.seek(off)
+        hdr = f.read(12)
+        num = struct.unpack(">H", hdr[4:6])[0]
+        tbl = f.read(16 * num)
+        where = {}
+        for i in range(num):
+            rec = tbl[i * 16:(i + 1) * 16]
+            where[rec[:4]] = struct.unpack(">I", rec[8:12])[0]
+        f.seek(where[b"head"] + 18)
+        upm = struct.unpack(">H", f.read(2))[0]
+        f.seek(where[b"OS/2"] + 74)
+        asc, desc = struct.unpack(">HH", f.read(4))
+    return upm / (asc + desc) if asc + desc else 0.89
+
+
+@st.cache_data(show_spinner=False)
+def font_em_ratio(family, refresh_token=0):
+    """Multiply an ASS font size by this to get the same text size in CSS pixels (Arial: about 0.895)."""
+    index = installed_fonts(refresh_token)
+    lower = {k.lower(): v for k, v in index.items()}
+    for fp in lower.get(str(family).lower(), []):
+        try:
+            r = _font_em_ratio(fp)
+            if 0.5 < r < 1.3:
+                return r
+        except Exception:
+            continue
+    return 0.895
+
+
+def css_text_size(family, ass_size, k):
+    """(font-size px, line-height px) in a preview scaled by k that matches libass drawing at ass_size."""
+    return ass_size * k * font_em_ratio(family, st.session_state.get("font_refresh", 0)), ass_size * k
+
+
 def prepare_export_fonts(families):
     if isinstance(families, str):
         families = [families]
@@ -854,7 +896,7 @@ def live_preview_html(img_bytes, size, style, text):
     k = 1 / 3
     pw, ph = int(w * k), int(h * k)
     scale = min(w, h) / 1080
-    fs = style["size"] * scale * k * 0.71
+    fs, lh = css_text_size(style["font"], max(10, int(style["size"] * scale)), k)
     b64 = base64.b64encode(img_bytes).decode()
     fam = style["font"].replace('"', "").replace("'", "")
     shown = html_lib.escape(text.upper() if style["upper"] else text).replace("\n", "<br>")
@@ -875,7 +917,8 @@ def live_preview_html(img_bytes, size, style, text):
         f"<div style=\"position:absolute;left:{style['x_pct']}%;top:{style['y_pct']}%;"
         f"transform:translate(-50%,-50%);width:max-content;max-width:88%;text-align:center;"
         f"font-family:'{fam}',Arial,sans-serif;font-size:{fs:.1f}px;"
-        f"font-weight:{700 if style['bold'] else 400};color:{style['color']};line-height:1.25;{stroke}\">"
+        f"font-weight:{700 if style['bold'] else 400};color:{style['color']};line-height:{lh:.2f}px;"
+        f"text-wrap:balance;{stroke}\">"
         f"<span style=\"{span_bg}\">{shown}</span></div></div>"
     )
 
@@ -917,10 +960,12 @@ def title_player_html(video_path: Path, size, fit, item, ms, style_title, width=
 
     title_div, cfg = "", "null"
     if item:
-        fs = item["size"] * scale * k * 0.71
+        fs, lh = css_text_size(ms["font"], max(10, int(item["size"] * scale)), k)
         text = html_lib.escape(item["text"].upper() if ms["upper"] else item["text"]).replace("\n", "<br>")
         fam = ms["font"].replace('"', "").replace("'", "")
-        stroke, bg = "", ""
+        stroke, bg, shadow = "", "", ""
+        if not ms.get("box"):     # the export's Motion style has a 3 px half-transparent shadow
+            shadow = f"text-shadow:{3 * scale * k:.2f}px {3 * scale * k:.2f}px 0 rgba(0,0,0,.5);"
         if ms.get("box"):
             bg = (f"background:{ms['box_color']};padding:{max(6, ms['outline'] * 2.5) * scale * k:.1f}px "
                   f"{max(8, ms['outline'] * 3) * scale * k:.1f}px;")
@@ -930,7 +975,8 @@ def title_player_html(video_path: Path, size, fit, item, ms, style_title, width=
         title_div = (f'<div id="ti" style="position:absolute;left:{item["x"]}%;top:{item["y"]}%;'
                      f'transform:translate(-50%,-50%);width:max-content;max-width:88%;text-align:center;'
                      f'pointer-events:none;opacity:0;font-family:\'{fam}\',Arial,sans-serif;font-size:{fs:.1f}px;'
-                     f'font-weight:{700 if ms["bold"] else 400};color:{ms["color"]};line-height:1.25;{stroke}">'
+                     f'font-weight:{700 if ms["bold"] else 400};color:{ms["color"]};line-height:{lh:.2f}px;'
+                     f'text-wrap:balance;{stroke}{shadow}">'
                      f'<span style="{bg}">{text}</span></div>')
         cfg = json.dumps(dict(start=item["start"], dur=item["dur"], anim=item["anim"], slide=90 * scale * k))
 
@@ -945,11 +991,12 @@ def title_player_html(video_path: Path, size, fit, item, ms, style_title, width=
         elif cs["outline"] > 0:
             cstroke = (f"-webkit-text-stroke:{cs['outline'] * scale * k * 2:.2f}px {cs['outline_color']};"
                        "paint-order:stroke fill;")
+        cfs, clh = css_text_size(cs["font"], max(10, int(cs["size"] * scale)), k)
         cap_div = (f'<div id="cap" style="position:absolute;left:{cs["x_pct"]}%;top:{cs["y_pct"]}%;'
                    f'transform:translate(-50%,-50%);width:max-content;max-width:88%;text-align:center;'
                    f'pointer-events:none;font-family:\'{fam}\',Arial,sans-serif;'
-                   f'font-size:{cs["size"] * scale * k * 0.71:.1f}px;font-weight:{700 if cs["bold"] else 400};'
-                   f'color:{cs["color"]};line-height:1.25;{cstroke}"><span id="capt" style="{cbg}"></span></div>')
+                   f'font-size:{cfs:.2f}px;font-weight:{700 if cs["bold"] else 400};'
+                   f'color:{cs["color"]};line-height:{clh:.2f}px;text-wrap:balance;{cstroke}"><span id="capt" style="{cbg}"></span></div>')
         cues = json.dumps([{"s": c["start"], "e": c["end"],
                             "t": (c["text"].upper() if cs["upper"] else c["text"])} for c in caps["cues"]])
 
