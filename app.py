@@ -557,6 +557,24 @@ def zoom_statements(src, w, h, plan, fx, fy, out="vz"):
     return zoom_chain(src, w, h, zoom_expr(plan), fx, fy, out)
 
 
+def reframe_values(project):
+    """Manual zoom / reposition chosen at export: (zoom factor, focus x 0..1, focus y 0..1), or None when off."""
+    r = project.get("reframe") or {}
+    z = float(r.get("zoom", 100)) / 100.0
+    if not r.get("on") or z <= 1.001:
+        return None
+    return z, (float(r.get("x", 0)) + 50) / 100.0, (float(r.get("y", 0)) + 50) / 100.0
+
+
+def reframe_statements(src, w, h, rf, out="vr"):
+    """Static zoom into the framed picture, then crop back to w x h around the chosen point. Runs before the
+    captions and title are drawn, so they stay exactly where they were placed."""
+    z, fx, fy = rf
+    zw, zh = max(w, int(w * z) // 2 * 2), max(h, int(h * z) // 2 * 2)
+    return [f"{src}scale={zw}:{zh}:flags=lanczos,crop={w}:{h}:x={int((zw - w) * fx)}:y={int((zh - h) * fy)},"
+            f"setsar=1[{out}]"]
+
+
 VIDEO_OUT = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
 PROXY_OUT = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "27", "-pix_fmt", "yuv420p"]
 
@@ -955,7 +973,7 @@ def _hex_rgba(hex_color, opacity_pct):
     return f"rgba({r},{g},{b},{opacity_pct / 100:.2f})"
 
 
-def title_player_html(video_path: Path, size, fit, item, ms, style_title, width=340, caps=None):
+def title_player_html(video_path: Path, size, fit, item, ms, style_title, width=340, caps=None, reframe=None):
     """Real-time preview: the cut video plays with the captions and the title drawn over it."""
     w, h = size
     pw = width
@@ -964,6 +982,15 @@ def title_player_html(video_path: Path, size, fit, item, ms, style_title, width=
     k = pw / w
     b64 = base64.b64encode(video_path.read_bytes()).decode()
     fit_css = "cover" if fit == "crop" else "contain"
+    # Zoom / reposition: scaling the video about the focus point is the same as the export's scale + crop.
+    vid_attr, vid_css, ctrl = "controls", "", ""
+    if reframe:
+        z, fx, fy = reframe
+        vid_attr = ""
+        vid_css = f"transform:scale({z:.4f});transform-origin:{fx * 100:.2f}% {fy * 100:.2f}%;"
+        ctrl = ('<div style="display:flex;gap:8px;align-items:center;margin-top:6px">'
+                '<button id="pp" style="width:64px">Play</button>'
+                '<input id="sk" type="range" min="0" max="1000" value="0" style="flex:1"></div>')
 
     title_div, cfg = "", "null"
     if item:
@@ -1010,15 +1037,21 @@ def title_player_html(video_path: Path, size, fit, item, ms, style_title, width=
     return """
 <div style="font-family:Arial,sans-serif;color:#ddd;width:%(pw)dpx">
  <div style="position:relative;width:%(pw)dpx;height:%(ph)dpx;overflow:hidden;background:#000;border-radius:6px">
-  <video id="v" src="data:video/mp4;base64,%(b64)s" controls playsinline style="width:100%%;height:100%%;object-fit:%(fit)s;display:block"></video>
+  <video id="v" src="data:video/mp4;base64,%(b64)s" %(vattr)s playsinline style="width:100%%;height:100%%;object-fit:%(fit)s;display:block;%(vcss)s"></video>
   %(title)s%(cap)s
  </div>
+ %(ctrl)s
 </div>
 <script>
 const C=%(cfg)s, CUES=%(cues)s, v=document.getElementById('v'), ti=document.getElementById('ti'),
       capt=document.getElementById('capt');
 const clamp=(x,a,b)=>Math.min(Math.max(x,a),b), ease=x=>1-Math.pow(1-x,3);
+const pp=document.getElementById('pp'), sk=document.getElementById('sk');
+if(pp){pp.onclick=()=>{v.paused?v.play():v.pause();}; v.onclick=pp.onclick;
+ v.onplay=()=>pp.textContent='Pause'; v.onpause=()=>pp.textContent='Play';
+ sk.oninput=()=>{if(v.duration)v.currentTime=v.duration*sk.value/1000;};}
 function frame(){
+ if(sk&&v.duration&&document.activeElement!==sk)sk.value=Math.round(1000*v.currentTime/v.duration);
  const now=v.currentTime;
  if(capt){let txt='';for(const c of CUES){if(now>=c.s&&now<c.e){txt=c.t;break;}} 
   capt.textContent=txt;capt.parentNode.style.display=txt?'block':'none';}
@@ -1039,7 +1072,7 @@ function frame(){
  }
  requestAnimationFrame(frame);}
 frame();
-</script>""" % dict(pw=pw, ph=ph, b64=b64, fit=fit_css, title=title_div, cap=cap_div, cfg=cfg, cues=cues)
+</script>""" % dict(pw=pw, ph=ph, b64=b64, fit=fit_css, vattr=vid_attr, vcss=vid_css, ctrl=ctrl, title=title_div, cap=cap_div, cfg=cfg, cues=cues)
 
 
 # ------------------------------------------------------------------- exports
@@ -1105,7 +1138,8 @@ def render_title_clip(project_dir: Path, project: dict, size, fit, style):
     raise RuntimeError("Title preview failed. " + err[-1200:])
 
 
-def export_still(project_dir: Path, project: dict, size, fit, style, t_out, plan, fx, fy):
+def export_still(project_dir: Path, project: dict, size, fit, style, t_out, plan, fx, fy, reframe=None,
+                 name="style_preview.png"):
     """One exact frame (zoom, captions and motion text; b-roll is not drawn here)."""
     keep = project["keep"]
     w, h = size
@@ -1125,8 +1159,11 @@ def export_still(project_dir: Path, project: dict, size, fit, style, t_out, plan
         stm.append(f"[vb]scale=iw*{z:.4f}:ih*{z:.4f}:flags=bicubic,"
                    f"crop={w}:{h}:x='(iw-ow)*{fx:.3f}':y='(ih-oh)*{fy:.3f}'[vz]")
         last = "vz"
+    if reframe:
+        stm += reframe_statements(f"[{last}]", w, h, reframe, "vr")
+        last = "vr"
     stm.append(f"[{last}]setpts=PTS+{t_out:.3f}/TB[vs]")   # the frame carries its real time, so animations are right
-    out = project_dir / "style_preview.png"
+    out = project_dir / name
     err = ""
     for fd in (_fontsdir_variants() if ass_name else [""]):
         tail = f"[vs]ass=filename={ass_name}{fd}[vout]" if ass_name else "[vs]null[vout]"
@@ -1139,7 +1176,7 @@ def export_still(project_dir: Path, project: dict, size, fit, style, t_out, plan
     raise RuntimeError("Preview failed. FFmpeg said: " + err[-1800:])
 
 
-def export_final(project_dir: Path, project: dict, size, fit, style, plan, fx, fy):
+def export_final(project_dir: Path, project: dict, size, fit, style, plan, fx, fy, reframe=None):
     keep, fps = project["keep"], project["fps"]
     w, h = size
     video = project_dir / project["video_file"]
@@ -1150,7 +1187,7 @@ def export_final(project_dir: Path, project: dict, size, fit, style, plan, fx, f
         ass_name = (project_dir / "export_subs.ass").relative_to(APP_DIR).as_posix()
         (APP_DIR / ass_name).write_text(build_ass(cues, w, h, style, motion=motion), encoding="utf-8")
         prepare_export_fonts([style["font"], motion["style"]["font"]])
-    out = project_dir / f"export_{w}x{h}_{fit}.mp4"
+    out = project_dir / f"export_{w}x{h}_{fit}{'_zoom' if reframe else ''}.mp4"
     err = ""
     for fd in (_fontsdir_variants() if ass_name else [""]):
         stm = cut_statements(keep, fps, denoise_filter(project)) + fit_statements("[vc]", fit, w, h, 30, "vb")
@@ -1158,6 +1195,9 @@ def export_final(project_dir: Path, project: dict, size, fit, style, plan, fx, f
         if plan and zoom_active(plan):
             stm += zoom_statements("[vb]", w, h, plan, fx, fy, "vz")
             last = "[vz]"
+        if reframe:
+            stm += reframe_statements(last, w, h, reframe, "vr")
+            last = "[vr]"
         stm.append(f"{last}ass=filename={ass_name}{fd}[vout]" if ass_name else f"{last}null[vout]")
         try:
             log = run_graph(["-i", str(video)], ";".join(stm),
@@ -2074,6 +2114,43 @@ def import_panel(idx, expanded):
                 goto(STEPS[idx])
 
 
+def reframe_panel(project_dir, project, idx, size_px, fit_val, style, still=True):
+    """Optional manual zoom and reposition, saved for the whole project and used by every export.
+    Captions and title are not zoomed."""
+    pid = project["project_id"]
+    saved = {"on": False, "zoom": 100, "x": 0, "y": 0, **(project.get("reframe") or {})}
+    with st.expander("Zoom in and reposition the video (optional)", expanded=bool(saved["on"]) and not still):
+        st.caption("Zooms into the whole video and lets you move the picture. Captions and the title stay "
+                   "where you placed them and are not zoomed.")
+        on = st.checkbox("Zoom in / reframe the video", value=saved["on"], key=f"rf_on_{pid}_{idx}")
+        a, b, c = st.columns(3)
+        zoom = a.slider("Zoom (%)", 100, 250, int(saved["zoom"]), 5, key=f"rf_z_{pid}_{idx}", disabled=not on)
+        x = b.slider("Move left / right", -50, 50, int(saved["x"]), 1, key=f"rf_x_{pid}_{idx}", disabled=not on,
+                     help="-50 shows the left edge, 0 the centre, 50 the right edge.")
+        y = c.slider("Move up / down", -50, 50, int(saved["y"]), 1, key=f"rf_y_{pid}_{idx}", disabled=not on,
+                     help="-50 shows the top edge, 0 the centre, 50 the bottom edge.")
+        new = {"on": on, "zoom": zoom, "x": x, "y": y}
+        if new != {k: saved[k] for k in new}:
+            project["reframe"] = new
+            save_project(project_dir, project)
+        if on and zoom > 100 and x == 0 and y == 0:
+            st.caption("Tip: at 0 / 0 the zoom stays centred. Move the sliders to reframe.")
+        if not still and on:
+            st.caption("The preview on the right shows the zoomed video. Place the captions and title after this.")
+        if still and on:
+            keep = project.get("keep") or []
+            _, total = _offsets(keep) if keep else (None, 0.0)
+            t = st.slider("Preview at (seconds)", 0.0, max(0.1, round(total - 0.1, 1)),
+                          min(1.0, max(0.0, round(total - 0.1, 1))), 0.1, key=f"rf_t_{pid}_{idx}")
+            try:
+                png = export_still(project_dir, project, size_px, fit_val, style, t, [], 0.5, 0.5,
+                                   reframe=reframe_values(project), name="reframe_preview.png")
+                st.image(str(png), width=240 if size_px[1] > size_px[0] else 360,
+                         caption="Exact export frame with captions and title")
+            except Exception as exc:
+                st.error(str(exc))
+
+
 def section_footer(project_dir, project, idx, next_label):
     pid = project["project_id"]
     st.divider()
@@ -2092,11 +2169,17 @@ def section_footer(project_dir, project, idx, next_label):
     size_px, fit_val = format_choice(project_dir, project, f"sf{idx}", show=idx != len(STEPS) - 1)
     if idx == len(STEPS) - 1:
         st.caption(f"Export size and framing: as chosen in the captions preview above ({size_px[0]}x{size_px[1]}).")
+    if idx != len(STEPS) - 1:
+        reframe_panel(project_dir, project, idx, size_px, fit_val, style)
+    elif reframe_values(project):
+        z = project["reframe"]
+        st.caption(f"Video zoom: {z['zoom']}% (left/right {z['x']}, up/down {z['y']}), as set in section B above.")
     c1, c2 = st.columns(2)
     if c1.button("Export video now", type="primary", key=f"sf_exp_{pid}_{idx}"):
         try:
             with st.spinner("Exporting from the original video. Large files take a few minutes..."):
-                out, elog, check = export_final(project_dir, project, size_px, fit_val, style, [], 0.5, 0.5)
+                out, elog, check = export_final(project_dir, project, size_px, fit_val, style, [], 0.5, 0.5,
+                                                reframe=reframe_values(project))
             st.session_state[f"sf_out_{pid}"] = (str(out), elog)
         except Exception as exc:
             st.error(str(exc))
@@ -2124,10 +2207,15 @@ def step_subtitles(project_dir, project):
         return
     left, right = st.columns([3, 2])
     with left:
-        st.header("B. Captions style and English")
+        st.header("B. Video zoom and position")
+        size_now, fit_now = shared_format(project)
+        reframe_panel(project_dir, project, 2, size_now, fit_now,
+                      {**DEFAULT_STYLE, **(project.get("style") or {})}, still=False)
+        st.divider()
+        st.header("C. Captions style and English")
         cap_style = step_captions(project_dir, project)
         st.divider()
-        st.header("C. Title")
+        st.header("D. Title")
         title_res = step_title(project_dir, project)
     with right:
         st.markdown('<div class="sticky-preview"></div>', unsafe_allow_html=True)
@@ -2141,8 +2229,9 @@ def step_subtitles(project_dir, project):
             caps = None
             if style.get("show") and caption_segments(project):
                 caps = {"cues": make_cues(caption_segments(project), style["max_words"]), "style": style}
-            components.html(title_player_html(base_clip, size_px, fit, item, ms, None, caps=caps),
-                            height=int(340 * size_px[1] / size_px[0]) + 20)
+            rf = reframe_values(project)
+            components.html(title_player_html(base_clip, size_px, fit, item, ms, None, caps=caps, reframe=rf),
+                            height=int(340 * size_px[1] / size_px[0]) + (56 if rf else 20))
             if not item:
                 st.caption("No title yet. Type the title text to see it here.")
         except Exception as exc:
