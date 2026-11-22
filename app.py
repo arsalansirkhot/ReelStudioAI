@@ -684,6 +684,13 @@ def font_em_ratio(family, refresh_token=0):
     return 0.895
 
 
+def ass_font_size(family, size, scale):
+    """ASS font size for a size slider value. The slider means what the preview always showed:
+    size * 0.71 CSS pixels at 1080p, so the export is sized to match the preview, whatever the font."""
+    ratio = font_em_ratio(family, st.session_state.get("font_refresh", 0))
+    return max(10, int(round(size * scale * 0.71 / ratio)))
+
+
 def css_text_size(family, ass_size, k):
     """(font-size px, line-height px) in a preview scaled by k that matches libass drawing at ass_size."""
     return ass_size * k * font_em_ratio(family, st.session_state.get("font_refresh", 0)), ass_size * k
@@ -800,7 +807,7 @@ def _ass_text(text, upper):
 
 def build_ass(cues, width, height, style, offset=0.0, motion=None):
     scale = min(width, height) / 1080
-    fs = max(10, int(style["size"] * scale))
+    fs = ass_font_size(style["font"], style["size"], scale)
     margin = int(width * 0.06)
     primary = hex_to_ass(style["color"])
     if style["box"]:
@@ -844,7 +851,7 @@ def build_ass(cues, width, height, style, offset=0.0, motion=None):
         if e0 <= 0 or not str(it.get("text", "")).strip():
             continue
         mx, my = int(width * float(it.get("x", 50)) / 100), int(height * float(it.get("y", 35)) / 100)
-        fsz = max(10, int(float(it.get("size", 110)) * scale))
+        fsz = ass_font_size(ms["font"], float(it.get("size", 110)), scale)
         tags = motion_tags(it.get("anim", MOTION_ANIMS[0]), mx, my) + "\\fs%d" % fsz
         lines.append(f"Dialogue: 1,{ass_time(max(0.0, s0))},{ass_time(e0)},Motion,,0,0,0,,"
                      "{%s}%s" % (tags, _ass_text(str(it["text"]), ms["upper"])))
@@ -896,7 +903,7 @@ def live_preview_html(img_bytes, size, style, text):
     k = 1 / 3
     pw, ph = int(w * k), int(h * k)
     scale = min(w, h) / 1080
-    fs, lh = css_text_size(style["font"], max(10, int(style["size"] * scale)), k)
+    fs, lh = css_text_size(style["font"], ass_font_size(style["font"], style["size"], scale), k)
     b64 = base64.b64encode(img_bytes).decode()
     fam = style["font"].replace('"', "").replace("'", "")
     shown = html_lib.escape(text.upper() if style["upper"] else text).replace("\n", "<br>")
@@ -960,7 +967,7 @@ def title_player_html(video_path: Path, size, fit, item, ms, style_title, width=
 
     title_div, cfg = "", "null"
     if item:
-        fs, lh = css_text_size(ms["font"], max(10, int(item["size"] * scale)), k)
+        fs, lh = css_text_size(ms["font"], ass_font_size(ms["font"], item["size"], scale), k)
         text = html_lib.escape(item["text"].upper() if ms["upper"] else item["text"]).replace("\n", "<br>")
         fam = ms["font"].replace('"', "").replace("'", "")
         stroke, bg, shadow = "", "", ""
@@ -991,7 +998,7 @@ def title_player_html(video_path: Path, size, fit, item, ms, style_title, width=
         elif cs["outline"] > 0:
             cstroke = (f"-webkit-text-stroke:{cs['outline'] * scale * k * 2:.2f}px {cs['outline_color']};"
                        "paint-order:stroke fill;")
-        cfs, clh = css_text_size(cs["font"], max(10, int(cs["size"] * scale)), k)
+        cfs, clh = css_text_size(cs["font"], ass_font_size(cs["font"], cs["size"], scale), k)
         cap_div = (f'<div id="cap" style="position:absolute;left:{cs["x_pct"]}%;top:{cs["y_pct"]}%;'
                    f'transform:translate(-50%,-50%);width:max-content;max-width:88%;text-align:center;'
                    f'pointer-events:none;font-family:\'{fam}\',Arial,sans-serif;'
