@@ -13,6 +13,7 @@ import time
 import unicodedata
 import uuid
 import wave
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -1357,6 +1358,226 @@ def transcribe(wav_path, profile, model_size, device_choice, custom_prompt, lang
     raise RuntimeError("Transcription failed. " + " | ".join(errors))
 
 
+# ======================================================= captions from a script
+DEV_VOWELS = {"अ": "a", "आ": "aa", "इ": "i", "ई": "ee", "उ": "u", "ऊ": "oo", "ऋ": "ri", "ए": "e", "ऐ": "ai",
+              "ओ": "o", "औ": "au", "ऑ": "o", "ॲ": "a", "ऍ": "e"}
+DEV_MATRAS = {"ा": "aa", "ि": "i", "ी": "ee", "ु": "u", "ू": "oo", "ृ": "ri", "े": "e", "ै": "ai", "ो": "o",
+              "ौ": "au", "ॉ": "o", "ॅ": "e", "ॆ": "e", "ॊ": "o"}
+DEV_CONS = {"क": "k", "ख": "kh", "ग": "g", "घ": "gh", "ङ": "n", "च": "ch", "छ": "chh", "ज": "j", "झ": "jh",
+            "ञ": "n", "ट": "t", "ठ": "th", "ड": "d", "ढ": "dh", "ण": "n", "त": "t", "थ": "th", "द": "d", "ध": "dh",
+            "न": "n", "प": "p", "फ": "ph", "ब": "b", "भ": "bh", "म": "m", "य": "y", "र": "r", "ल": "l", "ळ": "l",
+            "व": "v", "श": "sh", "ष": "sh", "स": "s", "ह": "h", "क़": "q", "ख़": "kh", "ग़": "g", "ज़": "z",
+            "ड़": "d", "ढ़": "rh", "फ़": "f", "य़": "y"}
+DEV_NUKTA = {"क": "q", "ख": "kh", "ग": "g", "ज": "z", "ड": "d", "ढ": "rh", "फ": "f"}
+
+
+def romanize(word):
+    """Rough Latin spelling of a Devanagari word, only used to compare it with a script word."""
+    out, i, n = [], 0, len(word)
+    while i < n:
+        ch = word[i]
+        if ch in DEV_CONS:
+            rom = DEV_CONS[ch]
+            if i + 1 < n and word[i + 1] == "़":
+                rom = DEV_NUKTA.get(ch, rom)
+                i += 1
+            nxt = word[i + 1] if i + 1 < n else ""
+            if nxt in DEV_MATRAS:
+                out.append(rom + DEV_MATRAS[nxt])
+                i += 2
+                continue
+            if nxt == "्":
+                out.append(rom)
+                i += 2
+                continue
+            out.append(rom + "a")
+        elif ch in DEV_VOWELS:
+            out.append(DEV_VOWELS[ch])
+        elif ch in DEV_MATRAS:
+            out.append(DEV_MATRAS[ch])
+        elif ch in "ंँ":
+            out.append("n")
+        elif ch == "ः":
+            out.append("h")
+        elif ch.isascii():
+            out.append(ch)
+        i += 1
+    return "".join(out).lower()
+
+
+def match_forms(word):
+    """Two simplified spellings that let 'hai', 'he' and 'है' (or 'nahi' and 'नहीं') be recognised as the same word."""
+    s = romanize(unicodedata.normalize("NFC", word.lower()))
+    s = re.sub(r"[^a-z0-9]", "", s)
+    if not s:
+        return "", ""
+    s = s.replace("chh", "C").replace("ch", "C").replace("sh", "S").replace("c", "k")
+    s = s.replace("w", "v").replace("z", "j").replace("q", "k").replace("x", "ks").replace("f", "ph")
+    s = re.sub(r"(?<=[^aeiouh])h", "", s)  # kh -> k, bh -> b ...
+    s = re.sub(r"(.)\1+", r"\1", s)        # aa -> a, ee -> e, tt -> t
+    vow = s.replace("ee", "i").replace("oo", "u")
+    lead = "V" if s[0] in "aeiou" else ""
+    skel = lead + re.sub(r"[aeiouy]", "", s)
+    return skel, vow
+
+
+def word_sim(a, b):
+    from difflib import SequenceMatcher
+    if not a[1] or not b[1]:
+        return 0.0
+    v = SequenceMatcher(None, a[1], b[1]).ratio()
+    if a[0] and b[0]:
+        v = max(v, 0.9 * SequenceMatcher(None, a[0], b[0]).ratio())
+    return v
+
+
+def read_script_file(data: bytes):
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        return data.decode("utf-16")
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return data.decode("utf-8", errors="replace")
+
+
+def script_lines(text, max_words=18):
+    """One caption line per line of the script. Very long lines are split at sentence ends, then by length."""
+    lines = []
+    for raw in text.replace("\r", "\n").split("\n"):
+        raw = " ".join(raw.split())
+        if not raw:
+            continue
+        parts = [raw]
+        if len(raw.split()) > max_words:
+            parts = [p.strip() for p in re.split(r"(?<=[।॥.!?])\s+", raw) if p.strip()]
+        for p in parts:
+            toks = p.split()
+            if len(toks) <= max_words:
+                lines.append(toks)
+            else:
+                k = math.ceil(len(toks) / max_words)
+                size = math.ceil(len(toks) / k)
+                lines += [toks[i:i + size] for i in range(0, len(toks), size)]
+    return lines
+
+
+def align_tokens(sf, hf, threshold=0.6):
+    """Match script words to heard words in order (like a diff). Returns {script index: heard index}."""
+    n, m = len(sf), len(hf)
+    if not n or not m:
+        return {}
+    band = max(60, abs(n - m) + 60)
+    GAP = -0.25
+    NEG = -1e9
+    score = [[NEG] * (m + 1) for _ in range(n + 1)]
+    move = [[0] * (m + 1) for _ in range(n + 1)]
+    score[0][0] = 0.0
+    for j in range(1, m + 1):
+        score[0][j], move[0][j] = GAP * j, 2
+    for i in range(1, n + 1):
+        c = i * m / n
+        lo, hi = max(0, int(c - band)), min(m, int(c + band))
+        if lo == 0:
+            score[i][0], move[i][0] = GAP * i, 1
+        for j in range(max(1, lo), hi + 1):
+            sim = word_sim(sf[i - 1], hf[j - 1])
+            best, mv = score[i - 1][j - 1] + (2 * sim - 1 if sim >= threshold else -1.0), 3
+            if score[i - 1][j] + GAP > best:
+                best, mv = score[i - 1][j] + GAP, 1
+            if score[i][j - 1] + GAP > best:
+                best, mv = score[i][j - 1] + GAP, 2
+            score[i][j], move[i][j] = best, mv
+    pairs, i, j = {}, n, m
+    while i > 0 or j > 0:
+        mv = move[i][j]
+        if mv == 3:
+            if word_sim(sf[i - 1], hf[j - 1]) >= threshold:
+                pairs[i - 1] = j - 1
+            i, j = i - 1, j - 1
+        elif mv == 1 or j == 0:
+            i -= 1
+        else:
+            j -= 1
+    return pairs
+
+
+def spread_over_speech(tokens, heard, t0, t1):
+    """Time a run of unmatched script words: spread them over the speech heard in that stretch (pauses are skipped),
+    or evenly over the gap when nothing was heard there. Longer words get more time."""
+    weights = [max(1, len(t)) for t in tokens]
+    total = float(sum(weights))
+    if heard:
+        spans = [(w["start"], max(w["end"], w["start"] + 0.02)) for w in heard]
+    else:
+        spans = [(t0, max(t1, t0 + 0.15 * len(tokens)))]
+    speech = sum(b - a for a, b in spans)
+
+    def at(frac):
+        left = frac * speech
+        for a, b in spans:
+            if left <= (b - a) + 1e-9:
+                return a + left
+            left -= b - a
+        return spans[-1][1]
+
+    out, acc = [], 0.0
+    for w in weights:
+        s, acc = at(acc / total), acc + w
+        out.append((s, at(acc / total)))
+    return out
+
+
+def align_script(script_text, heard_segments, total=None):
+    """Caption segments that use the script's words, timed by the words Whisper heard."""
+    lines = script_lines(script_text)
+    tokens = [t for line in lines for t in line]
+    heard = [w for s in heard_segments for w in (s.get("words") or []) if w.get("word", "").strip()]
+    if not heard:  # no word timings: fall back to the segment times
+        heard = [w for s in heard_segments for w in spread_words(s["text"], s["start"], s["end"])]
+    heard.sort(key=lambda w: w["start"])
+    if not tokens:
+        return [], {"script_words": 0, "matched": 0}
+    sf = [match_forms(t) for t in tokens]
+    hf = [match_forms(w["word"].strip()) for w in heard]
+    pairs = align_tokens(sf, hf)
+    end_all = total if total else (heard[-1]["end"] if heard else 0.15 * len(tokens))
+    times = [None] * len(tokens)
+    for i, j in pairs.items():
+        times[i] = (heard[j]["start"], max(heard[j]["end"], heard[j]["start"] + 0.05))
+    i = 0
+    while i < len(tokens):
+        if times[i] is not None:
+            i += 1
+            continue
+        k = i
+        while k < len(tokens) and times[k] is None:
+            k += 1
+        prev_j = pairs.get(i - 1, -1) if i > 0 else -1
+        next_j = pairs.get(k, len(heard)) if k < len(tokens) else len(heard)
+        t0 = times[i - 1][1] if i > 0 else 0.0
+        t1 = times[k][0] if k < len(tokens) else end_all
+        for x, tt in enumerate(spread_over_speech(tokens[i:k], heard[prev_j + 1:next_j], t0, t1)):
+            times[i + x] = tt
+        i = k
+    last = 0.0
+    for x, (a, b) in enumerate(times):  # keep the order strictly forward
+        a = max(a, last)
+        b = max(b, a + 0.02)
+        times[x], last = (round(a, 3), round(b, 3)), b
+    segments, pos = [], 0
+    for line in lines:
+        idxs = range(pos, pos + len(line))
+        words = [{"start": times[x][0], "end": times[x][1], "word": " " + tokens[x],
+                  **({} if x in pairs else {"estimated": True})} for x in idxs]
+        matched = sum(1 for x in idxs if x in pairs)
+        segments.append({"start": words[0]["start"], "end": words[-1]["end"], "text": " ".join(line),
+                         "words": words, "low": matched / len(line) < 0.34 and len(line) >= 2})
+        pos += len(line)
+    return segments, {"script_words": len(tokens), "matched": len(pairs), "heard_words": len(heard)}
+
+
 def render_cut_audio(project_dir: Path, project: dict):
     """Speech-only audio of the reviewed cut: this is what gets transcribed, so timings match the cut."""
     keep = project["keep"]
@@ -1748,7 +1969,29 @@ def step_transcript(project_dir, project):
     if stale:
         st.warning("You changed the cut after transcribing. The transcript below no longer matches the video. "
                    "Run the transcription again.")
-    with st.expander("Transcription settings", expanded=not project.get("transcript") or bool(stale)):
+    sources = ["Transcribe the video", "Use my script (.txt file or paste)"]
+    source = st.radio("Where should the caption words come from?", sources, horizontal=True,
+                      index=1 if project.get("text_source") == "script" else 0, key=f"tsrc_{pid}",
+                      help="With your script, the captions use your exact words. The app still listens to the "
+                           "audio, only to find when each word is spoken.")
+    use_script = source == sources[1]
+    script_text = ""
+    if use_script:
+        skey = f"script_{pid}"
+        if skey not in st.session_state:
+            st.session_state[skey] = project.get("script_text", "")
+        up = st.file_uploader("Script file (.txt)", type=["txt"], key=f"script_file_{pid}")
+        if up is not None and st.session_state.get(f"script_file_id_{pid}") != up.file_id:
+            st.session_state[f"script_file_id_{pid}"] = up.file_id
+            st.session_state[skey] = read_script_file(up.getvalue())
+        script_text = st.text_area("Script (you can also paste or edit it here)", height=180, key=skey,
+                                   help="Hindi, Marathi or Kokni, in Devanagari or Roman letters. Each line of the "
+                                        "script becomes one caption line, then it is split into short captions "
+                                        "using 'Words per caption'.")
+        st.caption("Only include what is spoken in the video (in the same order). Notes or headings that are not "
+                   "spoken will show up as lines marked ⚠ check.")
+    with st.expander("Timing settings (the app listens to the audio to time your script)" if use_script
+                     else "Transcription settings", expanded=not project.get("transcript") or bool(stale)):
         a, b, c = st.columns(3)
         profile = a.radio("Profile", list(PROFILES), horizontal=True,
                           index=list(PROFILES).index(project.get("profile", "Hindi")), key=f"tprof_{pid}")
@@ -1766,7 +2009,34 @@ def step_transcript(project_dir, project):
         custom_prompt = st.text_area("Custom vocabulary / names (optional)", value=project.get("custom_prompt", ""),
                                      height=80, key=f"tprompt_{pid}")
     bt1, bt2 = st.columns(2)
-    if bt1.button("Transcribe the video", type="primary"):
+    if use_script and bt1.button("Make captions from my script", type="primary"):
+        if not script_text.strip():
+            st.error("Add your script first: choose a .txt file or paste the text.")
+        else:
+            try:
+                heard_key = [project.get("keep_version", 0), profile, model_size, language_choice, use_vad,
+                             custom_prompt]
+                heard = project.get("script_heard") if project.get("script_heard_key") == heard_key else None
+                info = project.get("script_heard_info") or {}
+                if heard is None:
+                    with st.spinner("Listening to the audio to find when each word is spoken..."):
+                        wav = render_cut_audio(project_dir, project)
+                        heard, info = transcribe(wav, profile, model_size, device_choice, custom_prompt,
+                                                 language_choice, use_vad)
+                _, total = _offsets(keep)
+                segments, stats = align_script(script_text, heard, total)
+                project.update(profile=profile, custom_prompt=custom_prompt, transcript=segments,
+                               transcript_info={**info, "script": stats}, text_source="script",
+                               script_text=script_text, script_heard=heard, script_heard_key=heard_key,
+                               script_heard_info=info, transcript_keep_version=project.get("keep_version", 0),
+                               status="Captions from script – review required")
+                project.pop("english_segments", None)
+                save_project(project_dir, project)
+                write_text_exports(project_dir, segments)
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    if not use_script and bt1.button("Transcribe the video", type="primary"):
         try:
             with st.spinner("Preparing audio and transcribing..."):
                 wav = render_cut_audio(project_dir, project)
@@ -1774,14 +2044,14 @@ def step_transcript(project_dir, project):
                                             language_choice, use_vad)
             project.update(profile=profile, custom_prompt=custom_prompt, transcript=segments,
                            transcript_info=info, transcript_keep_version=project.get("keep_version", 0),
-                           status="Transcribed – review required")
+                           text_source="transcribe", status="Transcribed – review required")
             project.pop("english_segments", None)
             save_project(project_dir, project)
             write_text_exports(project_dir, segments)
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
-    if bt2.button("Quick test: first 25 seconds only"):
+    if not use_script and bt2.button("Quick test: first 25 seconds only"):
         try:
             with st.spinner("Testing the first 25 seconds..."):
                 wav = render_cut_audio(project_dir, project)
@@ -1805,8 +2075,21 @@ def step_transcript(project_dir, project):
                f"Language: {info.get('detected_language')} ({info.get('language_probability')})")
     if info.get("fallback_reason"):
         st.warning("GPU was skipped: " + info["fallback_reason"])
+    sc = info.get("script")
     low_n = sum(1 for x in segs if x.get("low"))
-    if low_n:
+    if sc:
+        found = sc["matched"] / max(1, sc["script_words"])
+        msg = (f"Captions use your script. {sc['matched']} of {sc['script_words']} script words were found in the "
+               "audio and timed exactly; the rest are timed by estimate between them.")
+        if found < 0.5:
+            st.warning(msg + " That is low: check that this script belongs to this video. If the words are right, "
+                       "try the other language (Marathi or Hindi) in Timing settings and make the captions again.")
+        else:
+            st.success(msg)
+        if low_n:
+            st.warning(f"{low_n} line(s) could not be found in the audio (marked in the Check column). Watch them "
+                       "and fix the times, or remove lines that are not spoken.")
+    elif low_n:
         st.warning(f"{low_n} line(s) look unreliable (marked in the Check column). Listen to them and correct the "
                    "text, or run the quick test again with another language or model.")
     _, total = _offsets(keep)
@@ -1829,7 +2112,8 @@ def step_transcript(project_dir, project):
             column_config={"Start (sec)": st.column_config.NumberColumn(format="%.3f", min_value=0.0),
                            "End (sec)": st.column_config.NumberColumn(format="%.3f", min_value=0.0),
                            "Text": st.column_config.TextColumn(width="large")},
-            key=f"editor_{pid}_{project.get('transcript_keep_version')}")
+            key=f"editor_{pid}_{project.get('transcript_keep_version')}_"
+                f"{zlib.crc32(json.dumps([[s['start'], s['text']] for s in segs]).encode('utf-8'))}")
         if st.button("Save transcript corrections", type="primary"):
             cleaned = rebuild_segments(edited, segs)
             project["transcript"] = cleaned
