@@ -1913,6 +1913,172 @@ def step_draft(project_dir, project):
         vc.video(str(review))
 
 
+# ---------------------------------------------------------------- remove repeats: timeline + retake finder
+def _norm_word(w):
+    return re.sub(r"[^\w']", "", str(w).lower(), flags=re.UNICODE)
+
+
+def review_words_now(project):
+    """Spoken words of the current cut, in the cut's own timeline. Words are stored in the original
+    video's timeline, so they stay valid after clips are removed (no need to listen again)."""
+    keep = project.get("keep") or []
+    src = project.get("review_words")
+    if not src and project.get("transcript") and project.get("transcript_keep_version") == project.get("keep_version"):
+        src = []
+        for seg in project["transcript"]:
+            for w in seg.get("words") or []:
+                if str(w.get("word", "")).strip():
+                    src.append({"s": out_to_src(float(w["start"]), keep), "e": out_to_src(float(w["end"]), keep),
+                                "w": str(w["word"]).strip()})
+    if not src:
+        return []
+    offs, _ = _offsets(keep)
+    out = []
+    for w in src:
+        mid = (w["s"] + w["e"]) / 2
+        for (a, b), o in zip(keep, offs):
+            if a <= mid < b:
+                out.append({"start": o + max(0.0, w["s"] - a), "end": o + min(b - a, w["e"] - a), "word": w["w"]})
+                break
+    return out
+
+
+def listen_for_review(project_dir, project):
+    """Quick word transcription of the current cut, saved in the original video's timeline."""
+    keep = project["keep"]
+    profile = project.get("profile") if project.get("profile") in PROFILES else next(iter(PROFILES))
+    wav = render_cut_audio(project_dir, project)
+    segs, _info = transcribe(wav, profile, "medium", "Auto (GPU if available)", project.get("custom_prompt", ""),
+                             "Profile default", False)
+    words = []
+    for seg in segs:
+        for w in seg.get("words") or []:
+            if str(w.get("word", "")).strip():
+                words.append({"s": round(out_to_src(float(w["start"]), keep), 3),
+                              "e": round(out_to_src(float(w["end"]), keep), 3), "w": str(w["word"]).strip()})
+    project["review_words"] = words
+    save_project(project_dir, project)
+
+
+def find_repeats(keep, words):
+    """Clip texts, clips that look like a retake of a later clip, and repeats inside the speech
+    ("mana hai na thoda mana hai na thoda") as time ranges to cut."""
+    from difflib import SequenceMatcher
+    offs, total = _offsets(keep)
+    clip_words = [[w for w in words if o <= (w["start"] + w["end"]) / 2 < o + (b - a)]
+                  for (a, b), o in zip(keep, offs)]
+    norm = [[_norm_word(w["word"]) for w in cw if _norm_word(w["word"])] for cw in clip_words]
+    retake = {}
+    for i, a in enumerate(norm):
+        if len(a) < 2:
+            continue
+        for j in range(i + 1, min(len(norm), i + 4)):
+            b = norm[j]
+            if len(b) < 2:
+                continue
+            head = SequenceMatcher(None, a, b[:len(a)]).ratio()
+            whole = SequenceMatcher(None, a, b).ratio()
+            if head >= 0.7 or whole >= 0.6:
+                retake[i] = j
+                break
+    ranges = []
+    flat = [(w, _norm_word(w["word"])) for w in words if _norm_word(w["word"])]
+    k = 0
+    while k < len(flat):
+        hit = None
+        for n in range(6, 1, -1):
+            if k + 2 * n <= len(flat) and [x[1] for x in flat[k:k + n]] == [x[1] for x in flat[k + n:k + 2 * n]]:
+                hit = n
+                break
+        def clip_of(t):
+            return next((i for i, ((a, b), o) in enumerate(zip(keep, offs)) if o <= t < o + (b - a)), None)
+        # a repeat that is already a whole retake clip is handled by that clip's tick box
+        if hit and clip_of(flat[k][0]["start"]) in retake:
+            k += hit
+            continue
+        if hit:
+            ranges.append({"From (s)": round(flat[k][0]["start"], 2), "To (s)": round(flat[k + hit][0]["start"], 2),
+                           "Words": " ".join(x[0]["word"] for x in flat[k:k + hit])})
+            k += hit
+        else:
+            k += 1
+    return clip_words, retake, ranges
+
+
+def review_timeline(keep, words, retake, ticked, ranges, view, key):
+    """Interactive timeline: clips, words and suggested cuts. Click a clip or drag across a part."""
+    import altair as alt
+    offs, total = _offsets(keep)
+    v0, v1 = view
+    span = max(0.5, v1 - v0)
+    px_per_s = 1000 / span
+
+    def fit(text, dur):
+        n = int(dur * px_per_s / 7)
+        return text if len(text) <= n else (text[:max(0, n - 1)] + "…" if n > 3 else "")
+
+    clips = []
+    for i, ((a, b), o) in enumerate(zip(keep, offs)):
+        said = " ".join(w["word"] for w in words if o <= (w["start"] + w["end"]) / 2 < o + (b - a))
+        status = "Retake (suggested)" if i in retake and i in ticked else ("Ticked to remove" if i in ticked else "Clip")
+        clips.append({"clip": i + 1, "start": o, "end": o + (b - a), "row": "Clips", "status": status,
+                      "label": fit(f"{i + 1} · {said}" if said else str(i + 1), b - a)})
+    wrows = [{"start": w["start"], "end": w["end"], "row": "Words", "label": fit(w["word"], w["end"] - w["start"])}
+             for w in words if w["end"] > v0 and w["start"] < v1]
+    srows = [{"start": r["From (s)"], "end": r["To (s)"], "row": "Repeats", "label": fit(r["Words"], r["To (s)"] - r["From (s)"])}
+             for r in ranges]
+    x = alt.X("start:Q", title="seconds", scale=alt.Scale(domain=[v0, v1], nice=False))
+    y = alt.Y("row:N", title=None, sort=["Clips", "Words", "Repeats"], scale=alt.Scale(domain=["Clips", "Words", "Repeats"]))
+    brush = alt.selection_interval(encodings=["x"], name="brush")
+    pick = alt.selection_point(fields=["clip"], name="pick", on="click", clear="dblclick")
+    colours = alt.Scale(domain=["Clip", "Retake (suggested)", "Ticked to remove"], range=["#8a8f98", "#e5534b", "#c9771f"])
+    clip_rect = (alt.Chart(alt.Data(values=clips)).mark_rect(cornerRadius=3, stroke="white", strokeWidth=1.5)
+                 .encode(x=x, x2="end:Q", y=y, color=alt.Color("status:N", scale=colours, legend=alt.Legend(orient="top", title=None)),
+                         opacity=alt.condition(pick, alt.value(1.0), alt.value(0.75)),
+                         tooltip=[alt.Tooltip("clip:O", title="Clip"), alt.Tooltip("start:Q", format=".2f", title="Starts (s)"),
+                                  alt.Tooltip("label:N", title="Said")])
+                 .add_params(brush, pick))
+    clip_txt = alt.Chart(alt.Data(values=clips)).mark_text(align="left", dx=4, color="white", fontSize=11).encode(
+        x=x, y=y, text="label:N")
+    layers = [clip_rect, clip_txt]
+    if wrows:
+        layers.append(alt.Chart(alt.Data(values=wrows)).mark_rect(cornerRadius=2, color="#3b6ea8", stroke="white", strokeWidth=1)
+                      .encode(x=x, x2="end:Q", y=y))
+        layers.append(alt.Chart(alt.Data(values=wrows)).mark_text(align="left", dx=2, color="white", fontSize=10)
+                      .encode(x=x, y=y, text="label:N"))
+    if srows:
+        layers.append(alt.Chart(alt.Data(values=srows)).mark_rect(cornerRadius=2, color="#e5534b", opacity=0.85)
+                      .encode(x=x, x2="end:Q", y=y))
+        layers.append(alt.Chart(alt.Data(values=srows)).mark_text(align="left", dx=3, color="white", fontSize=10)
+                      .encode(x=x, y=y, text="label:N"))
+    chart = alt.layer(*layers).properties(height=170, width="container").configure_view(strokeWidth=0)
+    return st.altair_chart(chart, width="stretch", height=230, on_select="rerun", selection_mode=["brush", "pick"],
+                           key=key)
+
+
+def _selection_range(event):
+    try:
+        sel = event.selection if hasattr(event, "selection") else event["selection"]
+        brush = sel.get("brush") or {}
+        for v in brush.values():
+            if isinstance(v, (list, tuple)) and len(v) == 2:
+                return float(min(v)), float(max(v))
+    except Exception:
+        pass
+    return None
+
+
+def _selection_clip(event):
+    try:
+        sel = event.selection if hasattr(event, "selection") else event["selection"]
+        pts = sel.get("pick") or []
+        if pts:
+            return int(pts[0]["clip"]) - 1
+    except Exception:
+        pass
+    return None
+
+
 def step_review(project_dir, project):
     pid = project["project_id"]
     st.subheader("Review the cut and remove retakes")
@@ -1929,13 +2095,74 @@ def step_review(project_dir, project):
         with st.spinner("Rendering the preview..."):
             render_review(project_dir, project)
     kv = project.get("keep_version", 0)
-    st.caption(f"{len(keep)} clips · {total:.1f}s (original {dur:.1f}s). Watch the preview, note the times "
-               "where you repeated yourself, then remove them on the right.")
+    jump_key = f"jump_{pid}_{kv}"
+
+    words = review_words_now(project)
+    clip_words, retake, ranges = find_repeats(keep, words)
+
+    # ---- find repeats (listen once; words are reused after every cut)
+    a, b = st.columns([3, 1])
+    if words:
+        n_sugg = len(retake) + len(ranges)
+        a.caption(f"{len(keep)} clips · {total:.1f}s (original {dur:.1f}s) · "
+                  + (f"**{n_sugg} likely repeat(s) found**: red on the timeline and pre-ticked below."
+                     if n_sugg else "No repeats found. Check the timeline and remove anything else you don't want."))
+    else:
+        a.caption(f"{len(keep)} clips · {total:.1f}s (original {dur:.1f}s). Click **Find repeats**: the app listens "
+                  "to the cut once (about a minute), shows what was said in every clip and marks the retakes.")
+    if b.button("🔎 Find repeats" if not project.get("review_words") else "🔎 Listen again", key=f"listen_{pid}",
+                type="primary" if not words else "secondary", use_container_width=True):
+        try:
+            with st.spinner("Listening to the cut..."):
+                listen_for_review(project_dir, project)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    # ---- timeline
+    view = (0.0, total)
+    if total > 45:
+        view = st.slider("Timeline window (seconds)", 0.0, float(round(total, 1)), (0.0, float(min(total, 40.0))), 1.0,
+                         key=f"tlwin_{pid}_{kv}")
+    ticked_default = set(retake)
+    event = review_timeline(keep, words, retake, ticked_default, ranges, view, key=f"tl_{pid}_{kv}")
+    rng = _selection_range(event)
+    pick = _selection_clip(event)
+    if rng and rng[1] - rng[0] >= 0.05:
+        st.session_state[jump_key] = float(round(max(0.0, rng[0]), 1))
+        said = " ".join(w["word"] for w in words if rng[0] <= (w["start"] + w["end"]) / 2 < rng[1])
+        c1, c2 = st.columns([3, 1])
+        c1.info(f"Selected **{rng[0]:.2f} – {rng[1]:.2f} s**" + (f": “{said}”" if said else "")
+                + ". The player below starts here.")
+        if c2.button("✂ Remove this part", type="primary", key=f"cutsel_{pid}_{kv}", use_container_width=True):
+            try:
+                with st.spinner("Applying and rendering..."):
+                    apply_keep(project_dir, project, remove_output_ranges(keep, [rng]))
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    elif pick is not None and pick < len(keep):
+        st.session_state[jump_key] = float(round(offs[pick], 1))
+        said = " ".join(w["word"] for w in clip_words[pick])
+        c1, c2 = st.columns([3, 1])
+        c1.info(f"Clip **{pick + 1}** selected ({offs[pick]:.2f} s)" + (f": “{said}”" if said else "")
+                + ". The player below starts here.")
+        if c2.button(f"✂ Remove clip {pick + 1}", type="primary", key=f"cutclip_{pid}_{kv}", use_container_width=True):
+            try:
+                with st.spinner("Applying and rendering..."):
+                    apply_keep(project_dir, project, [k for i, k in enumerate(keep) if i != pick])
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    else:
+        st.caption("Click a clip to play it, or drag across the timeline to select a part to remove. "
+                   "Double-click to clear.")
+
     left, right = st.columns([1, 2])
     with left:
-        jump = st.number_input("Play from (seconds)", 0.0, float(max(total - 0.1, 0.1)), 0.0, 1.0,
-                               key=f"jump_{pid}_{kv}")
-        st.video(str(review), start_time=int(jump))
+        jump = st.number_input("Play from (seconds)", 0.0, float(max(total - 0.1, 0.1)),
+                               float(st.session_state.get(jump_key, 0.0)), 0.5, key=jump_key)
+        st.video(str(review), start_time=float(jump))
         b1, b2 = st.columns(2)
         if b1.button("Undo last change", disabled=not project.get("keep_history")):
             project["keep"] = project["keep_history"].pop()
@@ -1953,31 +2180,23 @@ def step_review(project_dir, project):
             save_project(project_dir, project)
             st.rerun()
     with right:
-        st.markdown("**A. Remove a part you want gone (time range in the preview)**")
-        st.caption("Example: you repeated a line between 12.4 s and 15.9 s in the player, so add From 12.4, To 15.9.")
-        empty = pd.DataFrame({"From (s)": pd.Series(dtype=float), "To (s)": pd.Series(dtype=float)})
-        ranges_df = st.data_editor(empty, num_rows="dynamic", hide_index=True, use_container_width=True,
-                                   key=f"ranges_{pid}_{kv}")
-        if st.button("Remove these ranges"):
-            rng = []
-            for _, r in ranges_df.iterrows():
-                if pd.notna(r["From (s)"]) and pd.notna(r["To (s)"]) and r["To (s)"] > r["From (s)"]:
-                    rng.append((float(r["From (s)"]), float(r["To (s)"])))
-            if not rng:
-                st.warning("Add at least one range with To greater than From.")
-            else:
-                try:
-                    with st.spinner("Applying and rendering..."):
-                        apply_keep(project_dir, project, remove_output_ranges(keep, rng))
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-        st.markdown("**B. Remove whole clips**")
-        rows = [{"Clip": i + 1, "Starts at (s)": round(offs[i], 2), "Length (s)": round(b - a, 2), "Remove": False}
-                for i, (a, b) in enumerate(keep)]
-        clips_df = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True, height=260,
-                                  disabled=["Clip", "Starts at (s)", "Length (s)"], key=f"clips_{pid}_{kv}")
-        if st.button("Remove ticked clips"):
+        st.markdown("**Clips**: tick the ones to remove (suggested retakes are already ticked)")
+        rows = []
+        for i, (a_, b_) in enumerate(keep):
+            note = f"⚠ retake of clip {retake[i] + 1}" if i in retake else ""
+            rows.append({"Remove": i in ticked_default, "Clip": i + 1, "Starts (s)": round(offs[i], 2),
+                         "Length (s)": round(b_ - a_, 2),
+                         "What was said": " ".join(w["word"] for w in clip_words[i]) if words else "(click Find repeats)",
+                         "Note": note})
+        clips_df = st.data_editor(
+            pd.DataFrame(rows), hide_index=True, use_container_width=True, height=35 * (len(rows) + 1) + 20,
+            disabled=["Clip", "Starts (s)", "Length (s)", "What was said", "Note"], key=f"clips_{pid}_{kv}",
+            column_config={"Remove": st.column_config.CheckboxColumn(width="small"),
+                           "Clip": st.column_config.NumberColumn(width="small"),
+                           "Starts (s)": st.column_config.NumberColumn(format="%.2f", width="small"),
+                           "Length (s)": st.column_config.NumberColumn(format="%.2f", width="small"),
+                           "What was said": st.column_config.TextColumn(width="large")})
+        if st.button("Remove ticked clips", type="primary"):
             drop = {int(r["Clip"]) - 1 for _, r in clips_df.iterrows() if r["Remove"]}
             if not drop:
                 st.warning("Tick at least one clip.")
@@ -1985,6 +2204,32 @@ def step_review(project_dir, project):
                 try:
                     with st.spinner("Applying and rendering..."):
                         apply_keep(project_dir, project, [k for i, k in enumerate(keep) if i not in drop])
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        st.markdown("**Repeated words inside a clip**" + (" (found automatically, untick any you want to keep)"
+                                                          if ranges else ""))
+        rdf = pd.DataFrame([{"Remove": True, **r} for r in ranges] or [],
+                           columns=["Remove", "From (s)", "To (s)", "Words"])
+        st.caption("You can also add your own rows: From and To are seconds in the player.")
+        ranges_df = st.data_editor(rdf, num_rows="dynamic", hide_index=True, use_container_width=True,
+                                   height=35 * (max(len(rdf), 1) + 2) + 3, key=f"ranges_{pid}_{kv}",
+                                   column_config={"Remove": st.column_config.CheckboxColumn(width="small", default=True),
+                                                  "From (s)": st.column_config.NumberColumn(format="%.2f", step=0.05),
+                                                  "To (s)": st.column_config.NumberColumn(format="%.2f", step=0.05),
+                                                  "Words": st.column_config.TextColumn(width="large")})
+        if st.button("Remove these parts"):
+            sel = []
+            for _, r in ranges_df.iterrows():
+                if (r.get("Remove") is not False and pd.notna(r["From (s)"]) and pd.notna(r["To (s)"])
+                        and r["To (s)"] > r["From (s)"]):
+                    sel.append((float(r["From (s)"]), float(r["To (s)"])))
+            if not sel:
+                st.warning("Add or tick at least one row with To greater than From.")
+            else:
+                try:
+                    with st.spinner("Applying and rendering..."):
+                        apply_keep(project_dir, project, remove_output_ranges(keep, sel))
                     st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
