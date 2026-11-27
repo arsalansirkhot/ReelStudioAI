@@ -86,6 +86,70 @@ def clean_word(w):
     return re.sub(r"[^\w']", "", w, flags=re.UNICODE)
 
 
+# ------------------------------------------------------------------ colours & frames (shared with Template 2)
+# Ready-made colour styles for Talking1: punch words, the "red" and "cream" punch colours, subtitles, end card.
+T1_FIELDS = [("punch", "Punch words"), ("red", "Punch colour 'red'"), ("cream", "Punch colour 'cream'"),
+             ("subs", "Subtitles"), ("end", "End card text"), ("endBg", "End card background")]
+T1_PALETTES = {
+    "Classic (red & cream)": dict(punch="#FFFFFF", red="#D21F26", cream="#F1DDBF", subs="#FFFFFF", end="#F1DDBF", endBg="#000000"),
+    "Bold yellow": dict(punch="#FFFFFF", red="#FF3B30", cream="#FFD60A", subs="#FFFFFF", end="#FFD60A", endBg="#000000"),
+    "Ocean": dict(punch="#FFFFFF", red="#FF5A5F", cream="#7FDBFF", subs="#FFFFFF", end="#7FDBFF", endBg="#001F3F"),
+    "Candy": dict(punch="#FFFFFF", red="#FF2E88", cream="#FFC2E2", subs="#FFFFFF", end="#FFC2E2", endBg="#2A0A33"),
+    "Lime": dict(punch="#FFFFFF", red="#FF4D00", cream="#C6FF00", subs="#FFFFFF", end="#C6FF00", endBg="#0B0B0B"),
+    "Mono": dict(punch="#FFFFFF", red="#A8A8A8", cream="#E6E6E6", subs="#FFFFFF", end="#FFFFFF", endBg="#000000"),
+}
+
+
+def swatch_html(colours, labels):
+    cells = "".join(
+        f'<div style="text-align:center;font-size:11px;opacity:.85"><div style="width:44px;height:28px;border-radius:6px;'
+        f'background:{c};border:1px solid rgba(128,128,128,.45);margin:0 auto 3px"></div>{l}</div>'
+        for c, l in zip(colours, labels))
+    return f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin:2px 0 8px">{cells}</div>'
+
+
+def colour_panel(pid, prefix, fields, palettes, pal, pal_name, on_save, extra_reset=()):
+    """Colour style picker + '🎲 Surprise me' + one colour picker per role.
+    on_save(**changes) stores palette / palette_name (and anything extra the caller adds)."""
+    import random
+    # Widget keys carry a revision number: applying a style starts fresh widgets, otherwise Streamlit keeps
+    # showing the old colours in the pickers.
+    rev_key = f"{prefix}_rev_{pid}"
+    rev = st.session_state.get(rev_key, 0)
+    keys = {k: f"{prefix}_col_{k}_{pid}_{rev}" for k, _ in fields}
+    sel_key = f"{prefix}_palsel_{pid}_{rev}"
+
+    def reset_widgets():
+        st.session_state[rev_key] = rev + 1
+
+    names = list(palettes)
+    options = names + ([] if pal_name in names else ["Custom"])
+    a, b = st.columns([3, 1])
+    choice = a.selectbox("Colour style", options, index=options.index(pal_name if pal_name in names else "Custom"),
+                         key=sel_key, help="Pick a ready-made style, or change any colour below.")
+    b.write("")
+    surprise = b.button("🎲 Surprise me", key=f"{prefix}_surprise_{pid}", use_container_width=True,
+                        help="Random colour style (and frame), so this video looks different from the last one.")
+    if surprise:
+        pick = random.choice([n for n in names if n != pal_name] or names)
+        reset_widgets()
+        on_save(palette=dict(palettes[pick]), palette_name=pick, surprise=True)
+        st.rerun()
+    if choice != "Custom" and choice != pal_name:
+        reset_widgets()
+        on_save(palette=dict(palettes[choice]), palette_name=choice)
+        st.rerun()
+    cols = st.columns(len(fields) if len(fields) <= 4 else 4)
+    new = {}
+    for i, (k, label) in enumerate(fields):
+        new[k] = cols[i % len(cols)].color_picker(label, pal.get(k, "#FFFFFF"), key=keys[k])
+    if any(new[k] != pal.get(k) for k in new):
+        match = next((n for n, p in palettes.items() if all(p[k].lower() == new[k].lower() for k in new)), "Custom")
+        on_save(palette=new, palette_name=match)
+    st.markdown(swatch_html([new[k] for k, _ in fields], [l for _, l in fields]), unsafe_allow_html=True)
+    return new
+
+
 # ------------------------------------------------------------------ source video (the cut, no captions)
 def source_video(project_dir, project, A):
     """The reviewed cut as one plain video (no captions). Remotion reads it from the project folder."""
@@ -248,7 +312,8 @@ def build_props(project_dir, project, A, src):
     props = {"src": src, "subs": subtitles(project, A, s["romanize"]), "punch": punch,
              "cuts": merge_short(s.get("cuts") or [], s["min_shot"]), "bw": bw, "format": s["format"],
              "zoomMode": "push", "pushTo": float(s["push_to"]), "pushHolds": [], "eyeLine": float(s["eye_line"]),
-             "subLine": float(s["sub_line"]), "endCta": s["end_cta"]}
+             "subLine": float(s["sub_line"]), "endCta": s["end_cta"],
+             "palette": s.get("palette") or T1_PALETTES["Classic (red & cream)"]}
     path = project_dir / "talking1_props.json"
     path.write_text(json.dumps(props, ensure_ascii=False, indent=1), encoding="utf-8")
     return path
@@ -325,6 +390,16 @@ def step(project_dir, project, A):
     st.caption("Big punch words at eye level, small lowercase subtitles, warm grade with black & white moments, "
                "your push-in zoom on every shot and a 'follow karo' end card. Rendered with the same Remotion "
                "template Claude uses, so it matches those edits.")
+    s = settings(project)
+    # ---- colours (top of the step, so every video can get its own look)
+    with st.expander("🎨 Colours: make this video look different", expanded=True):
+        st.caption("Where each colour is used: punch words with no colour, the 'red' and 'cream' punch colours "
+                   "(chosen per word in the table below), the small subtitles and the end card.")
+        colour_panel(pid, "t1", T1_FIELDS, T1_PALETTES, s.get("palette") or T1_PALETTES["Classic (red & cream)"],
+                     s.get("palette_name") or "Classic (red & cream)",
+                     lambda surprise=False, **ch: save_settings(project_dir, project, A, **ch))
+        s = settings(project)
+
     problem = remotion_problem()
     if problem:
         st.error(problem)

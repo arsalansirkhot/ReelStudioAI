@@ -32,6 +32,30 @@ DEFAULTS = dict(format="1:1", punch=1.18, beat=1.6, hard_zoom=1.45, face_x=0.47,
                 romanize=True, min_shot=0.5)
 EVENT_COLS = ["Start", "End", "Type", "Text", "Colour", "Side", "Hard zoom"]
 
+# ---- colours & frames
+T2_FIELDS = [("text", "Captions, quotes & accent 'white'"), ("accent2", "Accent 'green'"), ("accent3", "Accent 'blue'"),
+             ("screenBg", "Blue screen background"), ("screenText", "Blue screen text"),
+             ("cardBg", "Card background"), ("cardText", "Cream card caption"), ("titleText", "Video card title")]
+T2_PALETTES = {
+    "Classic (blue, green & cream)": dict(text="#FFFFFF", accent2="#1F5A2B", accent3="#0715A6", screenBg="#0715A6",
+                                          screenText="#FFFFFF", cardBg="#FDFDE4", cardText="#1F5A2B", titleText="#151515"),
+    "Sunset": dict(text="#FFFFFF", accent2="#E4572E", accent3="#F3A712", screenBg="#E4572E", screenText="#FFF6E5",
+                   cardBg="#FFF1E0", cardText="#B23A1E", titleText="#2B1B12"),
+    "Ocean": dict(text="#FFFFFF", accent2="#0E7C86", accent3="#1B4DE0", screenBg="#0B3D91", screenText="#E6F4FF",
+                  cardBg="#EAF6F6", cardText="#0E5E66", titleText="#0B1F33"),
+    "Candy": dict(text="#FFFFFF", accent2="#D6246E", accent3="#7B2FF7", screenBg="#7B2FF7", screenText="#FFFFFF",
+                  cardBg="#FFF0F6", cardText="#A0154F", titleText="#2A0A33"),
+    "Forest & gold": dict(text="#FFFFFF", accent2="#2F6B3A", accent3="#C9A227", screenBg="#1E3D2A", screenText="#F4EBD0",
+                          cardBg="#F4EFE1", cardText="#2F6B3A", titleText="#1E2A1E"),
+    "Night neon": dict(text="#FFFFFF", accent2="#00C2A8", accent3="#FF3D7F", screenBg="#101820", screenText="#00E5C4",
+                       cardBg="#101820", cardText="#00E5C4", titleText="#FFFFFF"),
+    "Mono": dict(text="#FFFFFF", accent2="#111111", accent3="#6B6B6B", screenBg="#111111", screenText="#FFFFFF",
+                 cardBg="#F2F2F2", cardText="#111111", titleText="#111111"),
+}
+FRAMES = {"As designed": None, "Soft shadow": "shadow", "Rounded": "rounded", "Polaroid": "polaroid",
+          "Tilted polaroid": "tilted", "Outline": "outline", "Circle": "circle", "No frame": "none"}
+CARD_TYPES = ["blue screen", "cream card", "video card"]
+
 
 def settings(project):
     return {**DEFAULTS, **(project.get("template2") or {})}
@@ -187,9 +211,14 @@ def build_props(project_dir, project, A, src):
     s = settings(project)
     props = {"src": src, "words": spoken_words(project, A, s["romanize"]),
              "cuts": t1.merge_short(s.get("cuts") or [], s["min_shot"]),
-             "events": event_rows_to_props(s.get("events") or [], s["hard_zoom"]),
+             "events": event_rows_to_props(
+                 [r for r in s.get("events") or [] if r.get("Type") not in CARD_TYPES or r.get("Type") in s.get("cards", CARD_TYPES)],
+                 s["hard_zoom"]),
              "format": s["format"], "face": {"x": float(s["face_x"]), "y": float(s["face_y"]), "w": float(s["face_w"])},
-             "punch": float(s["punch"]), "beat": float(s["beat"])}
+             "punch": float(s["punch"]), "beat": float(s["beat"]),
+             "palette": s.get("palette") or T2_PALETTES["Classic (blue, green & cream)"]}
+    if FRAMES.get(s.get("frame_name") or "As designed"):
+        props["frame"] = FRAMES[s["frame_name"]]
     path = project_dir / "template2_props.json"
     path.write_text(json.dumps(props, ensure_ascii=False, indent=1), encoding="utf-8")
     return path
@@ -236,6 +265,43 @@ def step(project_dir, project, A):
     st.caption("Small white captions beside the head, accent words in white / green / blue, big top-left quotes, "
                "quick jump-cuts with punch-ins, a blue text screen, a cream card and a video card. Rendered with "
                "the same Remotion template Claude uses.")
+    s = settings(project)
+    # ---- colours & frames (top of the step, so every video can get its own look)
+    with st.expander("🎨 Colours & frames: make this video look different", expanded=True):
+
+        def save_look(surprise=False, **ch):
+            if surprise:  # a random frame too
+                import random
+                cur = s.get("frame_name") or "As designed"
+                ch["frame_name"] = random.choice([f for f in FRAMES if f != cur])
+            save_settings(project_dir, project, A, **ch)
+
+        st.markdown("**Colours**")
+        st.caption("'white', 'green' and 'blue' in the text plan's Colour column use accent colours 1-3 below, so "
+                   "changing them here recolours every accent word at once.")
+        t1.colour_panel(pid, "t2", T2_FIELDS, T2_PALETTES,
+                        s.get("palette") or T2_PALETTES["Classic (blue, green & cream)"],
+                        s.get("palette_name") or "Classic (blue, green & cream)", save_look)
+        s = settings(project)
+        frame_key = f"t2_frame_{pid}_{st.session_state.get(f't2_rev_{pid}', 0)}"
+        st.markdown("**Frame around the shrunk video** (cream card and video card)")
+        names = list(FRAMES)
+        cur = s.get("frame_name") or "As designed"
+        frame_name = st.radio("Frame", names, index=names.index(cur) if cur in names else 0, horizontal=True,
+                              key=frame_key, label_visibility="collapsed")
+        if frame_name != cur:
+            save_settings(project_dir, project, A, frame_name=frame_name)
+        st.markdown("**Cards to use in this video**")
+        on = s.get("cards", CARD_TYPES)
+        cc = st.columns(3)
+        picked = [c for i, c in enumerate(CARD_TYPES)
+                  if cc[i].checkbox(c.capitalize(), value=c in on, key=f"t2_card_{c}_{pid}")]
+        if picked != list(on):
+            save_settings(project_dir, project, A, cards=picked)
+        st.caption("Unticked cards are skipped even if they're in the text plan. Where they appear is set by the "
+                   "Start / End times in the plan below.")
+        s = settings(project)
+
     problem = t1.remotion_problem()
     if problem:
         st.error(problem)
