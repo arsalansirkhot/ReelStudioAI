@@ -271,6 +271,30 @@ def render_still(project_dir, project, A, t):
     return out
 
 
+def props_key(props_path):
+    """Changes whenever anything that affects the picture changes (punch words, cuts, look, subtitles)."""
+    import hashlib
+    return hashlib.md5(Path(props_path).read_bytes()).hexdigest()
+
+
+def render_preview(project_dir, project, A, start, length, total, fps=30):
+    """Low-resolution preview video from the same Remotion composition, so it looks exactly like the
+    final render, only smaller. length=None renders the whole video (with the end card)."""
+    src = source_video(project_dir, project, A)
+    props = build_props(project_dir, project, A, src)
+    out = project_dir / "talking1_preview.mp4"
+    args = ["render", "src/index.ts", COMPOSITION, str(out), f"--props={props}", "--scale=0.5", "--crf=26"]
+    if length is not None:
+        last = max(1, int(total * fps) - 1)
+        a = min(int(start * fps), last - 1)
+        b = min(int((start + length) * fps), last)
+        args.append(f"--frames={a}-{b}")
+    if out.exists():
+        out.unlink()
+    run_remotion(args, project_dir)
+    return out, props_key(props)
+
+
 def render_video(project_dir, project, A):
     src = source_video(project_dir, project, A)
     props = build_props(project_dir, project, A, src)
@@ -402,22 +426,63 @@ def step(project_dir, project, A):
     if any(s[k] != v for k, v in new.items()):
         save_settings(project_dir, project, A, **new)
         s = settings(project)
-    p1, p2 = st.columns([2, 1])
+    # ---- 4. preview
+    st.markdown("#### 4 · Preview before rendering")
+    st.caption("Made with the same Remotion template as the final video, so punch words, subtitles, zoom, "
+               "B&W and the end card look exactly as they will, only at lower resolution. "
+               "Uses the saved punch words, so click Save above first.")
+    try:
+        cur_key = props_key(build_props(project_dir, project, A, src))
+    except Exception:
+        cur_key = None
     first_punch = (s.get("punch") or [{"Start": 1.0}])[0]["Start"]
-    t_prev = p1.slider("Preview frame at (seconds)", 0.0, max(0.1, round(total - 0.1, 1)),
-                       float(min(round(first_punch + 0.1, 1), max(0.0, total - 0.2))), 0.1, key=f"t1_tprev_{pid}")
-    if p2.button("Show this frame", key=f"t1_still_{pid}"):
-        try:
-            with st.spinner("Rendering one frame (about 15 seconds)..."):
-                st.session_state[f"t1_stillimg_{pid}"] = str(render_still(project_dir, project, A, t_prev))
-        except Exception as exc:
-            st.error(str(exc))
-    still = st.session_state.get(f"t1_stillimg_{pid}")
-    if still and Path(still).exists():
-        st.image(still, width=360, caption="Exact frame from the final render")
+    max_t = max(0.1, round(total - 0.1, 1))
+    mode = st.radio("Preview", ["A few seconds", "Whole video (takes longer)", "One frame"], horizontal=True,
+                    key=f"t1_pmode_{pid}")
+    p1, p2 = st.columns([2, 1])
+    if mode == "One frame":
+        t_prev = p1.slider("Frame at (seconds)", 0.0, max_t,
+                           float(min(round(first_punch + 0.1, 1), max(0.0, total - 0.2))), 0.1,
+                           key=f"t1_tprev_{pid}")
+        if p2.button("Show this frame", key=f"t1_still_{pid}"):
+            try:
+                with st.spinner("Rendering one frame (about 15 seconds)..."):
+                    st.session_state[f"t1_stillimg_{pid}"] = str(render_still(project_dir, project, A, t_prev))
+            except Exception as exc:
+                st.error(str(exc))
+        still = st.session_state.get(f"t1_stillimg_{pid}")
+        if still and Path(still).exists():
+            st.image(still, width=360, caption="Exact frame from the final render")
+    else:
+        whole = mode.startswith("Whole")
+        if whole:
+            start, length = 0.0, None
+            p1.caption(f"The whole {total:.0f} s video plus the end card, at half resolution. "
+                       "Takes about as long as half a full render.")
+        else:
+            start = p1.slider("Start at (seconds)", 0.0, max_t, float(max(0.0, min(first_punch - 0.5, max_t))),
+                              0.5, key=f"t1_pstart_{pid}")
+            length = p1.slider("Length (seconds)", 2, 15, 6, 1, key=f"t1_plen_{pid}")
+            p1.caption("About 20 to 40 seconds to make.")
+        if p2.button("Make preview", type="primary", key=f"t1_pbtn_{pid}"):
+            try:
+                with st.spinner("Making the preview with Remotion..."):
+                    out, key = render_preview(project_dir, project, A, start, length, total)
+                st.session_state[f"t1_prev_{pid}"] = (str(out), key, out.stat().st_mtime)
+            except Exception as exc:
+                st.error(str(exc))
+        prev = st.session_state.get(f"t1_prev_{pid}")
+        if prev and Path(prev[0]).exists():
+            v, info = st.columns([1, 1])
+            v.video(Path(prev[0]).read_bytes())
+            if cur_key and prev[1] != cur_key:
+                info.warning("You changed something after this preview. Click Make preview again to see it.")
+            else:
+                info.success("Preview is up to date with your current settings.")
+            info.caption("Happy with it? Render the full-quality video below.")
 
-    # ---- 4. render
-    st.markdown("#### 4 · Render")
+    # ---- 5. render
+    st.markdown("#### 5 · Render")
     st.caption("Uses the saved punch words. Save them above first. A 35 s video takes about 2-4 minutes.")
     if st.button("Render Talking1 video", type="primary", key=f"t1_render_{pid}"):
         try:
