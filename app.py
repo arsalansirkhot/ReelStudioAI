@@ -71,11 +71,18 @@ try:
     import talking1_preset
 except Exception:
     talking1_preset = None
+# Template 2 add-on (Poorvay style): template2_preset.py, also in its own file. It needs talking1_preset.
+try:
+    import template2_preset
+except Exception:
+    template2_preset = None
 
 STEPS = ["1 · Remove pauses", "2 · Remove repeats", "3 · Subtitles & title"]
 SUBS_IDX = 2  # the subtitles & title step (its footer exports with the caption settings)
 if talking1_preset:
     STEPS.append("4 · Talking1 style")
+if talking1_preset and template2_preset:
+    STEPS.append("5 · Template 2")
 VIDEO_TYPES = ["mp4", "mov", "m4v", "mkv"]
 
 PROFILES = {
@@ -2539,6 +2546,8 @@ SECTIONS = [(step_draft, "Continue: remove repeats →"), (step_review, "Continu
 if talking1_preset:  # Talking1 add-on
     SECTIONS[SUBS_IDX] = (step_subtitles, "Continue: Talking1 style →")
     SECTIONS.append((lambda pdir_, pdata_: talking1_preset.step(pdir_, pdata_, globals()), None))
+if talking1_preset and template2_preset:  # Template 2 add-on
+    SECTIONS.append((lambda pdir_, pdata_: template2_preset.step(pdir_, pdata_, globals()), None))
 
 
 # ================================================================ main script
@@ -2587,5 +2596,5 @@ else:
     pdir, pdata = current
     fn, nxt = SECTIONS[idx]
     fn(pdir, pdata)
-    if nxt is not None:  # the Talking1 step has its own render button
+    if nxt is not None:  # the Talking1 / Template 2 steps have their own render button
         section_footer(pdir, pdata, idx, nxt)
