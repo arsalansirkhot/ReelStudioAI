@@ -59,8 +59,8 @@ def remotion_problem():
                 "REELSTUDIO_REMOTION_DIR to its folder and restart the app.")
     if not (REMOTION_DIR / "node_modules").exists():
         return f"Remotion is not installed yet. Run 'npm install' in {REMOTION_DIR}."
-    if not Path(npx_path()).exists() and not shutil.which("npx"):
-        return "Node.js (npx) was not found. Install Node.js and restart the app."
+    if not Path(node_path()).exists():
+        return "Node.js was not found. Install Node.js and restart the app."
     return None
 
 
@@ -254,12 +254,26 @@ def build_props(project_dir, project, A, src):
     return path
 
 
+def node_path():
+    return shutil.which("node") or r"C:\Program Files\nodejs\node.exe"
+
+
+REMOTION_CLI = REMOTION_DIR / "node_modules" / "@remotion" / "cli" / "remotion-cli.js"
+
+
 def run_remotion(args, project_dir):
-    cmd = [npx_path(), "remotion", *args, "--public-dir", str(project_dir), "--log", "error"]
+    # Run Remotion's CLI file with node directly. Going through npx made npm hand the command to
+    # cmd.exe, which in some app sessions failed with "'remotion' is not recognized".
+    if REMOTION_CLI.exists():
+        cmd = [node_path(), str(REMOTION_CLI), *args]
+    else:
+        cmd = [npx_path(), "remotion", *args]
+    cmd += ["--public-dir", str(project_dir), "--log", "error"]
     r = subprocess.run(cmd, cwd=str(REMOTION_DIR), capture_output=True, text=True, encoding="utf-8",
                        errors="replace")
     if r.returncode != 0:
-        raise RuntimeError("Remotion failed:\n" + (r.stderr or r.stdout)[-2500:])
+        detail = "\n".join(x for x in (r.stderr.strip(), r.stdout.strip()) if x)
+        raise RuntimeError("Remotion failed:\n" + detail[-2500:])
 
 
 def render_still(project_dir, project, A, t):
