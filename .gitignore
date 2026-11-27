@@ -12,3 +12,4 @@ github_token.txt
 installed_version.txt
 run_windows.bat.new
 tools/
+live_preview_cache/

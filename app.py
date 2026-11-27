@@ -2079,6 +2079,134 @@ def _selection_clip(event):
     return None
 
 
+# ---------------------------------------------------------------- cut player: mark start / end while watching
+CUT_PLAYER_CSS = """
+.cp{font-family:var(--st-font, sans-serif);color:var(--st-text-color, inherit)}
+.cp video{width:100%;border-radius:8px;background:#000;display:block}
+.cp .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.cp button{font:inherit;font-size:14px;padding:6px 12px;border-radius:8px;cursor:pointer;
+  border:1px solid rgba(128,128,128,.45);background:transparent;color:inherit}
+.cp button:hover{border-color:var(--st-primary-color, #ff4b4b)}
+.cp button.mk{flex:1;font-weight:600}
+.cp button.on{border-color:var(--st-primary-color, #ff4b4b);color:var(--st-primary-color, #ff4b4b)}
+.cp button.go{background:var(--st-primary-color, #ff4b4b);border-color:var(--st-primary-color, #ff4b4b);color:#fff;flex:1}
+.cp .t{font-variant-numeric:tabular-nums;opacity:.8;margin-left:auto}
+.cp .sel{margin-top:8px;font-size:14px;opacity:.9}
+"""
+
+CUT_PLAYER_JS = """
+export default function(component) {
+  const { data, parentElement, setTriggerValue } = component;
+  let root = parentElement.querySelector('.cp');
+  if (!root) {
+    root = document.createElement('div');
+    root.className = 'cp';
+    root.innerHTML = `
+      <video controls playsinline preload="auto"></video>
+      <div class="row">
+        <button data-a="back" title="Back 0.1 s">−0.1 s</button>
+        <button data-a="fwd" title="Forward 0.1 s">+0.1 s</button>
+        <span class="t">0.00 s</span>
+      </div>
+      <div class="row">
+        <button data-a="in" class="mk">⟦ Mark start</button>
+        <button data-a="out" class="mk">Mark end ⟧</button>
+      </div>
+      <div class="sel">Play the video, pause where the unwanted part starts and click <b>Mark start</b>, then where it ends and click <b>Mark end</b>.</div>
+      <div class="row">
+        <button data-a="hear">▶ Hear it without this part</button>
+        <button data-a="clear">Clear</button>
+      </div>
+      <div class="row"><button data-a="cut" class="go">✂ Remove this part</button></div>`;
+    parentElement.appendChild(root);
+    root.st = { a: null, b: null, src: null, start: null, hear: false };
+    const v = root.querySelector('video');
+    const st = root.st;
+    const fmt = (x) => x.toFixed(2) + ' s';
+    const show = () => {
+      root.querySelector('[data-a=in]').classList.toggle('on', st.a !== null);
+      root.querySelector('[data-a=out]').classList.toggle('on', st.b !== null);
+      const sel = root.querySelector('.sel');
+      if (st.a !== null && st.b !== null) {
+        sel.innerHTML = `Cut <b>${fmt(st.a)} → ${fmt(st.b)}</b> (${(st.b - st.a).toFixed(2)} s). Click <b>Hear it</b> to check, then <b>Remove this part</b>.`;
+      } else if (st.a !== null) {
+        sel.innerHTML = `Start marked at <b>${fmt(st.a)}</b>. Now play on and click <b>Mark end</b> where the unwanted part ends.`;
+      } else if (st.b !== null) {
+        sel.innerHTML = `End marked at <b>${fmt(st.b)}</b>. Now go back and click <b>Mark start</b>.`;
+      }
+    };
+    root.show = show;
+    v.addEventListener('seeked', () => { root.querySelector('.t').textContent = fmt(v.currentTime); });
+    v.addEventListener('timeupdate', () => {
+      root.querySelector('.t').textContent = fmt(v.currentTime);
+      if (st.hear && st.a !== null && st.b !== null) {
+        if (v.currentTime >= st.a && v.currentTime < st.b) v.currentTime = st.b;
+        else if (v.currentTime >= st.b + 2) { v.pause(); st.hear = false; }
+      }
+    });
+    root.querySelectorAll('button').forEach((btn) => btn.addEventListener('click', () => {
+      const a = btn.dataset.a;
+      const t = Math.round(v.currentTime * 100) / 100;
+      if (a === 'back') v.currentTime = Math.max(0, v.currentTime - 0.1);
+      if (a === 'fwd') v.currentTime = Math.min(v.duration || 1e9, v.currentTime + 0.1);
+      if (a === 'in') { st.a = t; if (st.b !== null && st.b <= st.a) st.b = null; }
+      if (a === 'out') { st.b = t; if (st.a !== null && st.a >= st.b) st.a = null; }
+      if (a === 'clear') { st.a = null; st.b = null;
+        root.querySelector('.sel').innerHTML = 'Marks cleared. Mark a new start and end.'; }
+      if (a === 'hear') {
+        if (st.a === null || st.b === null) { root.querySelector('.sel').innerHTML = 'Mark a start and an end first.'; return; }
+        st.hear = true; v.currentTime = Math.max(0, st.a - 2); v.play();
+      }
+      if (a === 'cut') {
+        if (st.a === null || st.b === null || st.b - st.a < 0.04) {
+          root.querySelector('.sel').innerHTML = 'Mark a start and an end first (end after start).'; return;
+        }
+        root.querySelector('.sel').innerHTML = 'Removing and rendering the new preview...';
+        setTriggerValue('cut', { a: st.a, b: st.b });
+        return;
+      }
+      if (a === 'in' || a === 'out') { v.pause(); show(); }
+    }));
+  }
+  const v = root.querySelector('video');
+  if (root.st.src !== data.id) {
+    root.st.src = data.id; root.st.a = null; root.st.b = null; root.st.start = null;
+    root.querySelectorAll('.mk').forEach((b) => b.classList.remove('on'));
+    root.querySelector('.sel').innerHTML = 'Play the video, pause where the unwanted part starts and click <b>Mark start</b>, then where it ends and click <b>Mark end</b>.';
+    v.src = data.src;
+  }
+  if (root.st.start !== data.start) {
+    root.st.start = data.start;
+    const seek = () => { try { v.currentTime = data.start || 0; } catch (e) {} };
+    if (v.readyState >= 1) seek(); else v.addEventListener('loadedmetadata', seek, { once: true });
+  }
+}
+"""
+
+
+@st.cache_resource
+def _cut_player_component():
+    return st.components.v2.component("reelstudio_cut_player", html="", css=CUT_PLAYER_CSS, js=CUT_PLAYER_JS)
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def _video_data_url(path_str, mtime):
+    return "data:video/mp4;base64," + base64.b64encode(Path(path_str).read_bytes()).decode("ascii")
+
+
+def cut_player(video_path, start, key):
+    """Video player with Mark start / Mark end. Returns (a, b) seconds when the user clicks Remove."""
+    p = Path(video_path)
+    mtime = p.stat().st_mtime
+    res = _cut_player_component()(data={"src": _video_data_url(str(p), mtime), "id": f"{p.name}:{mtime}",
+                                        "start": float(start)},
+                                  key=key, on_cut_change=lambda: None)
+    cut = getattr(res, "cut", None)
+    if isinstance(cut, dict) and cut.get("b") is not None and cut.get("a") is not None and cut["b"] > cut["a"]:
+        return float(cut["a"]), float(cut["b"])
+    return None
+
+
 def step_review(project_dir, project):
     pid = project["project_id"]
     st.subheader("Review the cut and remove retakes")
@@ -2155,14 +2283,21 @@ def step_review(project_dir, project):
             except Exception as exc:
                 st.error(str(exc))
     else:
-        st.caption("Click a clip to play it, or drag across the timeline to select a part to remove. "
-                   "Double-click to clear.")
+        st.caption("Click a clip to play it, or drag across the timeline to select a part. Double-click to clear. "
+                   "To cut something the app didn't find, mark it in the player below while you watch.")
 
-    left, right = st.columns([1, 2])
+    left, right = st.columns([5, 7])
     with left:
-        jump = st.number_input("Play from (seconds)", 0.0, float(max(total - 0.1, 0.1)),
-                               float(st.session_state.get(jump_key, 0.0)), 0.5, key=jump_key)
-        st.video(str(review), start_time=float(jump))
+        st.markdown("**Watch and mark a part to cut**")
+        marked = cut_player(review, st.session_state.get(jump_key, 0.0), key=f"cutplayer_{pid}")
+        if marked:
+            try:
+                with st.spinner(f"Removing {marked[0]:.2f}–{marked[1]:.2f} s and rendering..."):
+                    apply_keep(project_dir, project, remove_output_ranges(keep, [marked]))
+                st.session_state[f"jump_{pid}_{kv + 1}"] = float(max(0.0, marked[0] - 1.0))
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
         b1, b2 = st.columns(2)
         if b1.button("Undo last change", disabled=not project.get("keep_history")):
             project["keep"] = project["keep_history"].pop()
