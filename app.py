@@ -76,13 +76,22 @@ try:
     import template2_preset
 except Exception:
     template2_preset = None
+# Clean-audio add-on: clean_audio_preset.py (DeepFilterNet background noise removal), shown as the first step.
+try:
+    import clean_audio_preset
+except Exception:
+    clean_audio_preset = None
 
-STEPS = ["1 · Remove pauses", "2 · Remove repeats", "3 · Subtitles & title"]
+STEPS = ["Remove pauses", "Remove repeats", "Subtitles & title"]
 SUBS_IDX = 2  # the subtitles & title step (its footer exports with the caption settings)
 if talking1_preset:
-    STEPS.append("4 · Talking1 style")
+    STEPS.append("Talking1 style")
 if talking1_preset and template2_preset:
-    STEPS.append("5 · Template 2")
+    STEPS.append("Template 2")
+if clean_audio_preset:  # Clean-audio add-on: first step, so every later step shifts by one
+    STEPS.insert(0, "Clean audio")
+    SUBS_IDX += 1
+STEPS = [f"{i} · {name}" for i, name in enumerate(STEPS, 1)]
 VIDEO_TYPES = ["mp4", "mov", "m4v", "mkv"]
 
 PROFILES = {
@@ -1820,20 +1829,26 @@ def step_draft(project_dir, project):
                     st.rerun()
             else:
                 st.warning("Not enough phrases found to learn from. Try longer talking-head reels.")
-    st.markdown("**Background noise reduction (optional)**")
-    dn_old = project.get("denoise") or {"on": False, "level": 12}
-    d1, d2 = st.columns([1, 2])
-    dn_on = d1.checkbox("Reduce background noise", value=bool(dn_old.get("on", False)), key=f"dn_on_{pid}")
-    dn_level = d2.slider("Strength (dB of noise removed)", 6, 30, int(dn_old.get("level", 12)), key=f"dn_lv_{pid}",
-                         help="12 is gentle. Raise it for fan or street noise; too high makes the voice sound watery.")
-    dn_new = dict(on=dn_on, level=dn_level)
-    if dn_new != project.get("denoise"):
-        project["denoise"] = dn_new
-        save_project(project_dir, project)
-    if project.get("keep") and st.button("Apply noise setting to the preview", key=f"dn_apply_{pid}"):
-        with st.spinner("Rendering..."):
-            render_review(project_dir, project)
-        st.rerun()
+    if clean_audio_preset and project.get("audio_clean"):  # Clean-audio add-on: already cleaned in step 1
+        st.caption("Background noise: already removed in step 1 (Clean audio). Pauses are found on the clean audio.")
+    elif clean_audio_preset:
+        st.caption("Background noise: for the best result, clean the audio in step 1 (Clean audio) first.")
+    if not (clean_audio_preset and project.get("audio_clean")):
+        st.markdown("**Background noise reduction (optional, basic)**")
+        dn_old = project.get("denoise") or {"on": False, "level": 12}
+        d1, d2 = st.columns([1, 2])
+        dn_on = d1.checkbox("Reduce background noise", value=bool(dn_old.get("on", False)), key=f"dn_on_{pid}")
+        dn_level = d2.slider("Strength (dB of noise removed)", 6, 30, int(dn_old.get("level", 12)),
+                             key=f"dn_lv_{pid}",
+                             help="12 is gentle. Raise it for fan or street noise; too high makes the voice sound watery.")
+        dn_new = dict(on=dn_on, level=dn_level)
+        if dn_new != project.get("denoise"):
+            project["denoise"] = dn_new
+            save_project(project_dir, project)
+        if project.get("keep") and st.button("Apply noise setting to the preview", key=f"dn_apply_{pid}"):
+            with st.spinner("Rendering..."):
+                render_review(project_dir, project)
+            st.rerun()
     raw, thr = compute_keep(db, duration, offset_db, min_silence, pad)
     keep = snap_keep(raw, fps, duration)
     if not keep:
@@ -2468,6 +2483,8 @@ def section_footer(project_dir, project, idx, next_label):
              f"title: {'yes' if motion_items(project) else 'none'}"]
     if (project.get("denoise") or {}).get("on"):
         parts.append("noise reduction: on")
+    if project.get("audio_clean"):
+        parts.append("audio cleaned: yes")
     st.caption("Export includes: " + " · ".join(parts))
     size_px, fit_val = format_choice(project_dir, project, f"sf{idx}", show=idx != SUBS_IDX)
     if idx == SUBS_IDX:
@@ -2512,7 +2529,7 @@ def step_subtitles(project_dir, project):
     with left:
         st.header("B. Video zoom and position")
         size_now, fit_now = shared_format(project)
-        reframe_panel(project_dir, project, 2, size_now, fit_now,
+        reframe_panel(project_dir, project, SUBS_IDX, size_now, fit_now,
                       {**DEFAULT_STYLE, **(project.get("style") or {})}, still=False)
         st.divider()
         st.header("C. Captions style and English")
@@ -2544,10 +2561,12 @@ def step_subtitles(project_dir, project):
 SECTIONS = [(step_draft, "Continue: remove repeats →"), (step_review, "Continue: subtitles and title →"),
             (step_subtitles, "")]
 if talking1_preset:  # Talking1 add-on
-    SECTIONS[SUBS_IDX] = (step_subtitles, "Continue: Talking1 style →")
+    SECTIONS[2] = (step_subtitles, "Continue: Talking1 style →")
     SECTIONS.append((lambda pdir_, pdata_: talking1_preset.step(pdir_, pdata_, globals()), None))
 if talking1_preset and template2_preset:  # Template 2 add-on
     SECTIONS.append((lambda pdir_, pdata_: template2_preset.step(pdir_, pdata_, globals()), None))
+if clean_audio_preset:  # Clean-audio add-on: first step, with its own export / continue buttons
+    SECTIONS.insert(0, (lambda pdir_, pdata_: clean_audio_preset.step(pdir_, pdata_, globals()), None))
 
 
 # ================================================================ main script

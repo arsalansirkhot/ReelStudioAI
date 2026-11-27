@@ -10,7 +10,7 @@ The look itself is the Remotion template made with Claude in D:\\ClaudeAIVideoEd
 helpers of talking1_preset.py (cut video, cut detection, running Remotion).
 
 Kept in its own file: update.ps1 replaces app.py on updates, app.py only has a few lines that show
-this as step 5 (see the "Template 2 add-on" comments there).
+this as step 6 (see the "Template 2 add-on" comments there).
 """
 import json
 import re
@@ -44,7 +44,7 @@ def save_settings(project_dir, project, A, **changes):
 
 # ------------------------------------------------------------------ words (one entry per spoken word)
 def spoken_words(project, A, use_roman):
-    """Every word of the (corrected) step 3 transcript with its own time. When the corrected line has
+    """Every word of the (corrected) step 4 transcript with its own time. When the corrected line has
     the same number of words as Whisper heard, Whisper's word times are used; otherwise the line's
     time is shared between its words by their length."""
     out = []
@@ -245,11 +245,11 @@ def step(project_dir, project, A):
         st.info(A["NO_PROJECT_MSG"])
         return
     if not project.get("transcript"):
-        st.info("First transcribe the video in step 3 (A. Transcribe) and correct the words there. "
+        st.info("First transcribe the video in step 4 (A. Transcribe) and correct the words there. "
                 "The captions here come from that transcript.")
         return
     if project.get("transcript_keep_version") != project.get("keep_version"):
-        st.warning("You changed the cut after transcribing. Transcribe again in step 3 before using this template.")
+        st.warning("You changed the cut after transcribing. Transcribe again in step 4 before using this template.")
         return
     s = settings(project)
     _, total = A["_offsets"](keep)
@@ -257,14 +257,14 @@ def step(project_dir, project, A):
     # ---- 1. captions + text plan
     st.markdown("#### 1 · Review captions and the text plan")
     use_roman = st.checkbox("Write Devanagari words in Roman letters", value=s["romanize"], key=f"t2_rom_{pid}",
-                            help="Rough spelling. Correct the words in the step 3 transcript editor.")
+                            help="Rough spelling. Correct the words in the step 4 transcript editor.")
     if use_roman != s["romanize"]:
         save_settings(project_dir, project, A, romanize=use_roman)
     segs = lines(project, A, use_roman)
-    with st.expander(f"Transcript ({len(segs)} lines, from step 3)", expanded=False):
+    with st.expander(f"Transcript ({len(segs)} lines, from step 4)", expanded=False):
         st.code("\n".join(f"{c['start']:6.2f}  {c['text']}" for c in segs) or "(none)", language="text")
         st.caption("Every word not covered by a row below shows as a small caption beside the head. "
-                   "To fix a word, correct it in step 3 and save.")
+                   "To fix a word, correct it in step 4 and save.")
     if "events" not in s or st.button("Suggest the text plan again", key=f"t2_sugg_{pid}"):
         save_settings(project_dir, project, A, events=suggest_events(project, A, use_roman, total))
         s = settings(project)

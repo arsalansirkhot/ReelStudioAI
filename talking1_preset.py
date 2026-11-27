@@ -8,7 +8,7 @@ The look itself is the Remotion template made with Claude in D:\\ClaudeAIVideoEd
 exactly like the edits made there.
 
 Kept in its own file on purpose: update.ps1 replaces app.py on every update but never touches this
-file. app.py only needs a few lines to show it as step 4 (see the "Talking1 add-on" comments there).
+file. app.py only needs a few lines to show it as step 5 (see the "Talking1 add-on" comments there).
 Set the environment variable REELSTUDIO_REMOTION_DIR if the Remotion project moves.
 """
 import json
@@ -334,11 +334,11 @@ def step(project_dir, project, A):
         st.info(A["NO_PROJECT_MSG"])
         return
     if not project.get("transcript"):
-        st.info("First transcribe the video in step 3 (A. Transcribe) and correct the words there. "
+        st.info("First transcribe the video in step 4 (A. Transcribe) and correct the words there. "
                 "The subtitles here come from that transcript.")
         return
     if project.get("transcript_keep_version") != project.get("keep_version"):
-        st.warning("You changed the cut after transcribing. Transcribe again in step 3 before using this style.")
+        st.warning("You changed the cut after transcribing. Transcribe again in step 4 before using this style.")
         return
     s = settings(project)
     _, total = A["_offsets"](keep)
@@ -346,13 +346,13 @@ def step(project_dir, project, A):
     # ---- 1. subtitles + punch words (review before rendering)
     st.markdown("#### 1 · Review subtitles and punch words")
     use_roman = st.checkbox("Write Devanagari words in Roman letters", value=s["romanize"], key=f"t1_rom_{pid}",
-                            help="Rough spelling. Correct the words in the step 3 transcript editor.")
+                            help="Rough spelling. Correct the words in the step 4 transcript editor.")
     if use_roman != s["romanize"]:
         save_settings(project_dir, project, A, romanize=use_roman)
     subs = subtitles(project, A, use_roman)
-    with st.expander(f"Subtitles ({len(subs)} lines, from the step 3 transcript)", expanded=False):
+    with st.expander(f"Subtitles ({len(subs)} lines, from the step 4 transcript)", expanded=False):
         st.code("\n".join(f"{c['start']:6.2f}  {c['text']}" for c in subs) or "(none)", language="text")
-        st.caption("To fix a word, correct it in step 3 and save. It updates here.")
+        st.caption("To fix a word, correct it in step 4 and save. It updates here.")
     if "punch" not in s or st.button("Suggest punch words again", key=f"t1_sugg_{pid}"):
         punch = suggest_punch(project, A, use_roman)
         save_settings(project_dir, project, A, punch=punch, bw=suggest_bw(project, A, punch))
