@@ -63,7 +63,19 @@ h1{font-size:1.5rem!important} h2{font-size:1.25rem!important} h3{font-size:1.1r
 @media (max-width:640px){.stButton>button,.stDownloadButton>button{width:100%}}
 </style>""", unsafe_allow_html=True)
 
+# Talking1 add-on: optional preset in its own file (talking1_preset.py), which updates never replace.
+try:
+    import sys as _sys
+    if str(APP_DIR) not in _sys.path:
+        _sys.path.insert(0, str(APP_DIR))
+    import talking1_preset
+except Exception:
+    talking1_preset = None
+
 STEPS = ["1 · Remove pauses", "2 · Remove repeats", "3 · Subtitles & title"]
+SUBS_IDX = 2  # the subtitles & title step (its footer exports with the caption settings)
+if talking1_preset:
+    STEPS.append("4 · Talking1 style")
 VIDEO_TYPES = ["mp4", "mov", "m4v", "mkv"]
 
 PROFILES = {
@@ -2450,10 +2462,10 @@ def section_footer(project_dir, project, idx, next_label):
     if (project.get("denoise") or {}).get("on"):
         parts.append("noise reduction: on")
     st.caption("Export includes: " + " · ".join(parts))
-    size_px, fit_val = format_choice(project_dir, project, f"sf{idx}", show=idx != len(STEPS) - 1)
-    if idx == len(STEPS) - 1:
+    size_px, fit_val = format_choice(project_dir, project, f"sf{idx}", show=idx != SUBS_IDX)
+    if idx == SUBS_IDX:
         st.caption(f"Export size and framing: as chosen in the captions preview above ({size_px[0]}x{size_px[1]}).")
-    if idx != len(STEPS) - 1:
+    if idx != SUBS_IDX:
         reframe_panel(project_dir, project, idx, size_px, fit_val, style)
     elif reframe_values(project):
         z = project["reframe"]
@@ -2524,6 +2536,9 @@ def step_subtitles(project_dir, project):
 
 SECTIONS = [(step_draft, "Continue: remove repeats →"), (step_review, "Continue: subtitles and title →"),
             (step_subtitles, "")]
+if talking1_preset:  # Talking1 add-on
+    SECTIONS[SUBS_IDX] = (step_subtitles, "Continue: Talking1 style →")
+    SECTIONS.append((lambda pdir_, pdata_: talking1_preset.step(pdir_, pdata_, globals()), None))
 
 
 # ================================================================ main script
@@ -2572,4 +2587,5 @@ else:
     pdir, pdata = current
     fn, nxt = SECTIONS[idx]
     fn(pdir, pdata)
-    section_footer(pdir, pdata, idx, nxt)
+    if nxt is not None:  # the Talking1 step has its own render button
+        section_footer(pdir, pdata, idx, nxt)

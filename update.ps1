@@ -9,7 +9,7 @@ $Branch      = 'main'
 $TokenFile   = Join-Path $AppDir 'github_token.txt'
 $VersionFile = Join-Path $AppDir 'installed_version.txt'
 # Files copied from GitHub into this folder on every update
-$Files = @('app.py', 'requirements.txt', 'README.txt', 'update.ps1', '.streamlit/config.toml')
+$Files = @('app.py', 'talking1_preset.py', 'requirements.txt', 'README.txt', 'update.ps1', '.streamlit/config.toml')
 
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
