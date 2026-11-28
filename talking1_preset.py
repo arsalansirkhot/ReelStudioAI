@@ -11,6 +11,7 @@ Kept in its own file on purpose: update.ps1 replaces app.py on every update but 
 file. app.py only needs a few lines to show it as step 5 (see the "Talking1 add-on" comments there).
 Set the environment variable REELSTUDIO_REMOTION_DIR if the Remotion project moves.
 """
+import hashlib
 import http.server
 import json
 import os
@@ -29,7 +30,8 @@ SOURCE_NAME = "talking1_source.mp4"
 COLOURS = ["white", "red", "cream"]
 FORMATS = {"1:1 · Square": "1:1", "9:16 · Reels": "9:16", "Same as the video": "source"}
 DEFAULTS = dict(format="1:1", push_to=1.55, eye_line=0.33, sub_line=0.86, end_cta="follow karo",
-                romanize=True, min_shot=1.0, push_rate=0.12)
+                romanize=True, min_shot=1.0, push_rate=0.12, pop_on=True,
+                pop_volume=0.5)
 # Zoom speed limit (zoom added per second): short shots zoom in less instead of rushing to the full zoom.
 ZOOM_SPEEDS = {"Slow": 0.06, "Gentle": 0.12, "Medium": 0.2, "Fast (full zoom in every shot)": 0.0}
 
@@ -319,6 +321,18 @@ def grid_editor(df, key, column_config, disabled):
                           height=35 * (len(df) + 1) + 3, column_config=column_config, disabled=disabled)
 
 
+def grid_keep(state_key, edited, changed):
+    """After a grid edit: keep the same grid (True), so edits made while the page reloads aren't lost, or
+    rebuild it (False) when the edit changed nothing (e.g. a refused tick) or the same grid content was
+    already applied once (stops a reload loop)."""
+    sig = edited.to_json()
+    if not changed or st.session_state.get(state_key) == sig:
+        st.session_state.pop(state_key, None)
+        return False
+    st.session_state[state_key] = sig
+    return True
+
+
 def grid_changed(edited, base, cols):
     a = [[cell(edited.iloc[i][c]) for c in cols] for i in range(len(edited))]
     b = [[cell(base.iloc[i][c]) for c in cols] for i in range(len(base))]
@@ -521,6 +535,8 @@ def build_props(project_dir, project, A, src):
             item["color"] = p["Colour"]
         if str(p.get("Cream word") or "").strip():
             item["cream"] = str(p["Cream word"]).split()
+        if p.get("Pop") is False:
+            item["pop"] = False
         punch.append(item)
     punch.sort(key=lambda x: x["start"])
     bw = [[float(b["Start"]), float(b["End"])] for b in s.get("bw") or [] if float(b["End"]) > float(b["Start"])]
@@ -529,9 +545,168 @@ def build_props(project_dir, project, A, src):
              "zoomMode": "push", "pushTo": float(s["push_to"]), "pushRate": float(s["push_rate"]), "pushHolds": [], "eyeLine": float(s["eye_line"]),
              "subLine": float(s["sub_line"]), "endCta": s["end_cta"],
              "palette": s.get("palette") or T1_PALETTES["Classic (red & cream)"]}
+    pop = pop_props(project_dir, s)
+    if pop:
+        props["pop"] = pop
     path = project_dir / "talking1_props.json"
     path.write_text(json.dumps(props, ensure_ascii=False, indent=1), encoding="utf-8")
     return path
+
+
+# ------------------------------------------------------------------ pop sound on pop-out words (all templates)
+POP_FILE = "pop_sfx.wav"  # made in the project folder (Remotion's public dir), so no sound file is needed
+
+
+POP_SOURCE = Path(__file__).resolve().parent / "sfx" / "pop.wav"  # the user's pop (pop-4, lead-in trimmed)
+
+
+def ensure_pop(project_dir):
+    """The pop sound in the project folder: the app's sfx/pop.wav (kept in step with it), or, if that file
+    is missing, a short synthesised 'bubble pop' made once."""
+    path = project_dir / POP_FILE
+    if POP_SOURCE.exists():
+        data = POP_SOURCE.read_bytes()
+        if not path.exists() or path.read_bytes() != data:
+            path.write_bytes(data)
+        return path
+    if path.exists():
+        return path
+    import wave
+    sr = 48000
+    t = np.arange(int(0.12 * sr)) / sr
+    freq = 300 + 1100 * np.exp(-t / 0.012)
+    tone = np.sin(2 * np.pi * np.cumsum(freq) / sr) * (1 - np.exp(-t / 0.0006)) * np.exp(-t / 0.024)
+    rng = np.random.default_rng(7)
+    click = np.diff(rng.standard_normal(len(t) + 1)) * np.exp(-t / 0.0015) * 0.25
+    y = tone + click
+    y = y / np.max(np.abs(y)) * 0.9
+    pcm = (np.repeat(y[:, None], 2, axis=1) * 32767).astype("<i2")
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm.tobytes())
+    return path
+
+
+CLICK_FILE = "click_sfx.wav"
+CLICK_SOURCE = Path(__file__).resolve().parent / "sfx" / "click.wav"  # the user's mouse click (lead-in trimmed)
+
+
+def click_props(project_dir, s):
+    """The `click` prop (Template 3: a click when each B-roll clip appears), or None when off / missing."""
+    if not s.get("click_on", True) or float(s.get("click_volume", 0.5)) <= 0 or not CLICK_SOURCE.exists():
+        return None
+    path = project_dir / CLICK_FILE
+    data = CLICK_SOURCE.read_bytes()
+    if not path.exists() or path.read_bytes() != data:
+        path.write_bytes(data)
+    return {"src": CLICK_FILE, "volume": round(float(s.get("click_volume", 0.5)), 2)}
+
+
+def pop_props(project_dir, s):
+    """The `pop` prop for the templates, or None when the sound is off."""
+    if not s.get("pop_on", True) or float(s.get("pop_volume", 0.5)) <= 0:
+        return None
+    ensure_pop(project_dir)
+    return {"src": POP_FILE, "volume": round(float(s.get("pop_volume", 0.5)), 2)}
+
+
+def pop_controls(pid, prefix, s, save, what="pop words"):
+    """One row: pop sound on/off + volume. Changes save straight away."""
+    a, b = st.columns([1, 2])
+    on = a.checkbox(f"🔊 Pop sound on {what}", value=bool(s.get("pop_on", True)), key=f"{prefix}_popon_{pid}",
+                    help=f"A short pop each time one of the {what} appears.")
+    vol = b.slider("Pop volume", 0.1, 1.0, float(s.get("pop_volume", 0.5)), 0.05, key=f"{prefix}_popvol_{pid}",
+                   disabled=not on)
+    if on != bool(s.get("pop_on", True)) or abs(vol - float(s.get("pop_volume", 0.5))) > 1e-6:
+        save(pop_on=on, pop_volume=vol)
+
+
+# ------------------------------------------------------------------ per-line pop sound (grid column)
+POP_COL = "Pop SFX"
+POP_COL_HELP = "Play the pop sound on this line's pop words. Untick to keep this line silent."
+
+
+def _pop_items(words, groups, g, items, is_pop):
+    a = float(words[groups[g][0]]["start"]) - 0.01
+    b = float(words[groups[g][-1]]["end"])
+    return [k for k, it in enumerate(items) if is_pop(it) and a <= float(it["Start"]) <= b]
+
+
+def pop_values(words, groups, items, is_pop):
+    """Per line: ticked when it has pop words and none of them is silenced."""
+    out = []
+    for g in range(len(groups)):
+        ks = _pop_items(words, groups, g, items, is_pop)
+        out.append(bool(ks) and all(items[k].get("Pop", True) is not False for k in ks))
+    return out
+
+
+def apply_pop_col(words, groups, items, old_lines, new_lines, is_pop):
+    """Ticks changed in the Pop SFX column -> 'Pop' on the pop items of those lines."""
+    items, notes = [dict(x) for x in items], []
+    for g, (o, n) in enumerate(zip(old_lines, new_lines)):
+        want = bool(cell(n.get(POP_COL), False))
+        if want == bool(cell(o.get(POP_COL), False)):
+            continue
+        ks = _pop_items(words, groups, g, items, is_pop)
+        if not ks:
+            if want:
+                notes.append(f"The line at {float(words[groups[g][0]]['start']):.2f} s has no pop words, so there "
+                             "is no pop to play.")
+            continue
+        for k in ks:
+            items[k]["Pop"] = want
+    return items, notes
+
+
+# ------------------------------------------------------------------ carry forward (render once, at the end)
+# A template page can carry its settings forward instead of rendering. The finishing pages (Visual hook, and
+# later ones) then render the Remotion "Finish" composition: the template drawn live + their touches, in ONE
+# render. Saved as project["carry"] = {"template": "talking1" | "template2" | "template3", "at": time}.
+CARRY_TEMPLATES = {"talking1": ("Talking1", "Talking1"), "template2": ("Template2", "Template 2"),
+                   "template3": ("Template3", "Template 3")}
+
+
+def carry_button(project_dir, project, A, key, col):
+    """'Carry forward' next to a template's Render button: no render now, the Visual hook page renders it."""
+    pid = project["project_id"]
+    name = CARRY_TEMPLATES[key][1]
+    target = next((s for s in A.get("STEPS", []) if s.endswith("Visual hook")), None)
+    if not target:
+        return
+    if col.button("➡ Carry forward to Visual hook (no render)", key=f"carry_{key}_{pid}", use_container_width=True,
+                  help=f"Don't render now. The Visual hook page renders {name} with the hook in one go, always "
+                       "with this page's latest settings."):
+        project["carry"] = {"template": key, "at": __import__("datetime").datetime.now().isoformat(timespec="seconds")}
+        A["save_project"](project_dir, project)
+        st.session_state["_goto"] = target
+        st.rerun()
+    if (project.get("carry") or {}).get("template") == key:
+        col.caption(f"✓ {name} is carried forward to Visual hook.")
+
+
+def live_props(project_dir, pid, port, props, video):
+    """Props for the browser preview: the cut video, B-roll and sounds as URLs from the local preview server."""
+    vname = f"v/{pid}_{int(video.stat().st_mtime)}.mp4"
+    _LiveHandler.files[vname] = str(video)
+    props = json.loads(json.dumps(props))
+    props["src"] = f"http://127.0.0.1:{port}/{vname}"
+    for sk in ("pop", "click"):  # sound effects in the project folder
+        if props.get(sk) and not str(props[sk]["src"]).startswith("http"):
+            f = project_dir / props[sk]["src"]
+            if f.exists():
+                pname = f"p/{pid}_{sk}_{int(f.stat().st_mtime)}.wav"
+                _LiveHandler.files[pname] = str(f)
+                props[sk]["src"] = f"http://127.0.0.1:{port}/{pname}"
+    for b in props.get("brolls") or []:  # Template 3: B-roll clips in the project folder
+        f = project_dir / b["src"]
+        if f.exists() and not str(b["src"]).startswith("http"):
+            bname = f"b/{pid}_{f.stem}_{int(f.stat().st_mtime)}.mp4"
+            _LiveHandler.files[bname] = str(f)
+            b["src"] = f"http://127.0.0.1:{port}/{bname}"
+    return props
 
 
 def node_path():
@@ -610,8 +785,10 @@ import { createRoot } from "react-dom/client";
 import { Player, PlayerRef } from "@remotion/player";
 import { Poorvay } from "__SRC__/Poorvay";
 import { PunchWordEdit } from "__SRC__/PunchWordEdit";
+import { VisualHook } from "__SRC__/VisualHook";
+import { Finish } from "__SRC__/Finish";
 
-const COMPS: Record<string, React.FC<any>> = { Template2: Poorvay, Talking1: PunchWordEdit };
+const COMPS: Record<string, React.FC<any>> = { Template2: Poorvay, Template3: Poorvay, Talking1: PunchWordEdit, VisualHook, Finish };
 type Opts = { comp: string; props: any; frames: number; w: number; h: number; seek?: number; seekId?: number };
 
 const Live: React.FC<{ o: Opts }> = ({ o }) => {
@@ -661,7 +838,7 @@ def live_bundle():
     src = REMOTION_DIR / "src"
     newest = max((p.stat().st_mtime for p in src.rglob("*") if p.is_file()), default=0)
     out, stamp = LIVE_DIR / "live.js", LIVE_DIR / "stamp.txt"
-    key = f"{newest}|{REMOTION_DIR}"
+    key = f"{newest}|{REMOTION_DIR}|{hashlib.md5(LIVE_ENTRY.encode()).hexdigest()}"
     if out.exists() and stamp.exists() and stamp.read_text(encoding="utf-8") == key:
         return out
     LIVE_DIR.mkdir(exist_ok=True)
@@ -702,7 +879,8 @@ class _LiveHandler(http.server.BaseHTTPRequestHandler):
                 a = max(0, size - int(m.group(2)))
             status = 206
         self.send_response(status)
-        self.send_header("Content-Type", "text/javascript" if str(p).endswith(".js") else "video/mp4")
+        self.send_header("Content-Type", "text/javascript" if str(p).endswith(".js")
+                         else "audio/wav" if str(p).endswith(".wav") else "video/mp4")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(b - a + 1))
@@ -771,11 +949,8 @@ def live_preview(project_dir, project, A, prefix, comp, props_path, fmt, total, 
     except Exception as exc:
         st.warning(f"Live preview is not available: {exc}")
         return
-    vname = f"v/{pid}_{int(video.stat().st_mtime)}.mp4"
     _LiveHandler.files["live.js"] = str(bundle)
-    _LiveHandler.files[vname] = str(video)
-    props = json.loads(Path(props_path).read_text(encoding="utf-8"))
-    props["src"] = f"http://127.0.0.1:{port}/{vname}"
+    props = live_props(project_dir, pid, port, json.loads(Path(props_path).read_text(encoding="utf-8")), video)
     w, h = frame_size(fmt, project)
     seek_key, last_key = f"{prefix}_live_seek_{pid}", f"{prefix}_live_last_{pid}"
     if sel and st.session_state.get(last_key) != sel:
@@ -870,7 +1045,9 @@ def t1_from_rows(words, rows, owner, bw_owner, punch, bw):
             a, b = float(punch[k]["Start"]), float(punch[k]["End"])
         else:
             a, b = float(words[idx[0]]["start"]), float(words[idx[-1]]["end"])
-        new_punch.append({"Start": round(a, 2), "End": round(b, 2), "Text": text, "Colour": colour, "Cream word": cream})
+        pop = punch[k0].get("Pop", True) is not False if k0 is not None and 0 <= k0 < len(punch) else True
+        new_punch.append({"Start": round(a, 2), "End": round(b, 2), "Text": text, "Colour": colour, "Cream word": cream,
+                          "Pop": pop})
     new_bw = []
     for _, idx in group_runs(len(rows), lambda i: "b" if bool(cell(rows[i].get("B&W"), False)) else None,
                              bw_owner, lambda i: ""):
@@ -883,7 +1060,7 @@ def t1_from_rows(words, rows, owner, bw_owner, punch, bw):
     return sorted(new_punch, key=lambda r: r["Start"]), sorted(new_bw, key=lambda r: r["Start"])
 
 
-T1_LINE_COLS = ["Time", "Line", "Punch words", "Colour", "B&W"]
+T1_LINE_COLS = ["Time", "Line", "Punch words", "Colour", "Pop SFX", "B&W"]
 T1_LINE_EDIT = ["Punch words", "Colour", "B&W"]
 
 
@@ -942,6 +1119,8 @@ def _t1_grid(pid, rev, words, rows, owner, bw_owner, punch, bw, pal, store):
                 unsafe_allow_html=True)
     groups = line_groups(words)
     lines = t1_line_rows(words, groups, rows, owner, punch)
+    for ln, v in zip(lines, pop_values(words, groups, punch, lambda it: True)):
+        ln[POP_COL] = v
     df = pd.DataFrame(lines, columns=T1_LINE_COLS)
     edited = grid_editor(
         df, f"t1_grid_{pid}_{rev}",
@@ -952,12 +1131,18 @@ def _t1_grid(pid, rev, words, rows, owner, bw_owner, punch, bw, pal, store):
                                   "(e.g. 'IRFAN JUNEJO'). Several: separate with /. Empty = only subtitles."),
          "Colour": st.column_config.SelectboxColumn(options=list(T1_LABEL_TO_COLOUR),
                                                     help="Punch word colour (see the swatches)."),
+         POP_COL: st.column_config.CheckboxColumn(help=POP_COL_HELP),
          "B&W": st.column_config.CheckboxColumn(help="Black & white for this line.")},
         disabled=["Time", "Line"])
-    if grid_changed(edited, df, T1_LINE_EDIT):
-        p2, b2, notes = t1_apply_line_rows(words, groups, rows, owner, bw_owner, punch, bw, lines,
-                                           edited.to_dict("records"))
-        store(p2, b2, ("⚠ " + " ".join(notes)) if notes else None)
+    if grid_changed(edited, df, T1_LINE_EDIT + [POP_COL]):
+        recs = edited.to_dict("records")
+        p2, b2, notes = punch, bw, []
+        if grid_changed(edited, df, T1_LINE_EDIT):
+            p2, b2, notes = t1_apply_line_rows(words, groups, rows, owner, bw_owner, punch, bw, lines, recs)
+        if grid_changed(edited, df, [POP_COL]):
+            p2, n2 = apply_pop_col(words, groups, p2, lines, recs, lambda it: True)
+            notes += n2
+        store(p2, b2, ("⚠ " + " ".join(notes)) if notes else None, grid=edited)
 
 
 # ------------------------------------------------------------------ the step (UI)
@@ -1029,30 +1214,35 @@ def step(project_dir, project, A):
     st.markdown("#### 2 · Words")
     use_roman = s["romanize"]
     words = spoken_words(project, A, use_roman)
-    if "punch" not in s:
-        punch0 = suggest_punch(project, A, use_roman)
-        save(punch=punch0, bw=suggest_bw(project, A, punch0))
+    if "punch" not in s:  # starts as plain subtitles: you pick the punch words (or ask for a suggestion)
+        save(punch=[], bw=[])
         s = settings(project)
     punch, bw = s.get("punch") or [], s.get("bw") or []
     rows, owner, bw_owner = t1_plan_rows(words, punch, bw)
     rev_key = f"t1_grid_rev_{pid}"
     rev = st.session_state.get(rev_key, 0)
 
-    def store(new_punch, new_bw, note=None):
-        save(punch=new_punch, bw=new_bw)
-        st.session_state[rev_key] = rev + 1
+    def store(new_punch, new_bw, note=None, grid=None):
+        changed = (new_punch, new_bw) != (punch, bw)
+        if changed:
+            save(punch=new_punch, bw=new_bw)
+        if grid is None or not grid_keep(f"t1_applied_{pid}", grid, changed):
+            st.session_state[rev_key] = rev + 1
         if note:
             st.session_state[f"t1_note_{pid}"] = note
         st.rerun()
 
-    c1, c2 = st.columns([3, 1])
+    c1, c2, c3 = st.columns([4, 1, 1])
     c1.caption("Every spoken word shows in the small subtitles unless it's a punch word (big, at eye level). "
                "In the grid, type a line's **Punch words**, or **drag across the timeline** to select words. "
                "Changes are saved straight away and show in the live preview.")
-    if c2.button("↺ Suggest again", key=f"t1_sugg_{pid}", use_container_width=True,
-                 help="Replace the punch words and B&W moments with a fresh suggestion."):
+    if c2.button("✨ Suggest for me", key=f"t1_sugg_{pid}", use_container_width=True,
+                 help="Replace the punch words and B&W moments with a suggestion."):
         p0 = suggest_punch(project, A, use_roman)
         store(p0, suggest_bw(project, A, p0), "New suggestion made.")
+    if c3.button("⌫ All subtitles", key=f"t1_clear_{pid}", use_container_width=True,
+                 help="Remove every punch word and B&W moment: all lines back to plain subtitles."):
+        store([], [], "All lines are plain subtitles now.")
     note = st.session_state.pop(f"t1_note_{pid}", None)
     if note:
         st.toast(note.lstrip("⚠ "), icon="⚠️" if note.startswith("⚠") else "✅")
@@ -1096,6 +1286,8 @@ def step(project_dir, project, A):
         _t1_grid(pid, rev, words, rows, owner, bw_owner, punch, bw, pal, store)
 
     # ---- more settings
+    pop_controls(pid, "t1", s, save, "punch words")
+    s = settings(project)
     with st.expander("⚙ More settings: exact colours, zoom, text heights, end card, jump cuts"):
         st.markdown("**Exact colours**")
         custom_colours(pid, "t1", T1_FIELDS, pal, save)
@@ -1205,9 +1397,12 @@ def step(project_dir, project, A):
                 info.success("Preview is up to date with your current settings.")
 
     # ---- 4. render
-    st.markdown("#### 4 · Render")
-    st.caption("A 35 s video takes about 2-4 minutes.")
-    if st.button("Render Talking1 video", type="primary", key=f"t1_render_{pid}"):
+    st.markdown("#### 4 · Render or carry forward")
+    st.caption("Render the video now (about 2-4 minutes for 35 s), or carry it forward to the Visual hook page "
+               "and render it there once, with the hook.")
+    rc, cc = st.columns(2)
+    carry_button(project_dir, project, A, "talking1", cc)
+    if rc.button("Render Talking1 video", type="primary", key=f"t1_render_{pid}", use_container_width=True):
         try:
             with st.spinner("Rendering with Remotion..."):
                 out = render_video(project_dir, project, A)

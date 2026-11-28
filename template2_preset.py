@@ -29,7 +29,7 @@ COLOURS = ["white", "green", "blue"]
 SIDES = ["right", "left"]
 FORMATS = {"1:1 · Square": "1:1", "9:16 · Reels": "9:16", "16:9 · Wide": "16:9", "Same as the video": "source"}
 DEFAULTS = dict(format="1:1", punch=1.18, beat=1.6, hard_zoom=1.45, face_x=0.47, face_y=0.33, face_w=0.13,
-                romanize=True, min_shot=0.5)
+                romanize=True, min_shot=0.5, pop_on=True, pop_volume=0.5)
 EVENT_COLS = ["Start", "End", "Type", "Text", "Colour", "Side", "Hard zoom"]
 
 # ---- colours & frames
@@ -267,10 +267,11 @@ def events_from_rows(words, rows, owner, events):
             a, b = float(words[idx[0]]["start"]), float(words[idx[-1]]["end"])
             if t == "accent":
                 b = max(b, a + 0.5)
+        pop = events[k0].get("Pop", True) is not False if k0 is not None and 0 <= k0 < len(events) else True
         out.append({"Start": round(a, 2), "End": round(b, 2), "Type": t, "Text": text,
                     "Colour": key[1] if t == "accent" else "white",
                     "Side": key[2] if t == "accent" else "right",
-                    "Hard zoom": key[-1] if t in ("accent", "quote") else False})
+                    "Hard zoom": key[-1] if t in ("accent", "quote") else False, "Pop": pop})
     return sorted(out, key=lambda r: r["Start"])
 
 
@@ -296,6 +297,8 @@ def event_rows_to_props(rows, hard_zoom):
             ev["side"] = r.get("Side") if r.get("Side") in SIDES else "right"
         if bool(r.get("Hard zoom")) and kind in ("accent", "quote"):
             ev["zoom"] = float(hard_zoom)
+        if kind == "accent" and r.get("Pop") is False:
+            ev["pop"] = False
         out.append(ev)
     return sorted(out, key=lambda e: e["start"])
 
@@ -310,6 +313,9 @@ def build_props(project_dir, project, A, src):
              "palette": s.get("palette") or T2_PALETTES[DEFAULT_PALETTE]}
     if FRAMES.get(s.get("frame_name") or "As designed"):
         props["frame"] = FRAMES[s["frame_name"]]
+    pop = t1.pop_props(project_dir, s)
+    if pop:
+        props["pop"] = pop
     path = project_dir / "template2_props.json"
     path.write_text(json.dumps(props, ensure_ascii=False, indent=1), encoding="utf-8")
     return path
@@ -349,7 +355,17 @@ def render_video(project_dir, project, A):
     return out
 
 
-LINE_COLS = ["Time", "Line", "Show as", "Pop words", "Colour", "Side", "Hard zoom"]
+LINE_COLS = ["Time", "Line", "Show as", "Pop words", "Colour", "Side", "Hard zoom", "Pop SFX"]
+
+
+def is_accent(e):
+    return e.get("Type") == "accent"
+
+
+def with_pop_col(words, groups, lines, events):
+    for ln, v in zip(lines, t1.pop_values(words, groups, events, is_accent)):
+        ln[t1.POP_COL] = v
+    return lines
 LINE_EDIT = ["Show as", "Pop words", "Colour", "Side", "Hard zoom"]
 
 
@@ -426,7 +442,7 @@ def _t2_grid(pid, rev, words, rows, owner, events, pal, store):
     st.markdown(t1.swatch_html([pal["text"], pal["accent2"], pal["accent3"]], ["Main", "Colour 2", "Colour 3"]),
                 unsafe_allow_html=True)
     groups = t1.line_groups(words)
-    lines = line_rows(words, groups, rows, owner, events)
+    lines = with_pop_col(words, groups, line_rows(words, groups, rows, owner, events), events)
     df = pd.DataFrame(lines, columns=LINE_COLS)
     edited = t1.grid_editor(
         df, f"t2_grid_{pid}_{rev}",
@@ -439,11 +455,18 @@ def _t2_grid(pid, rev, words, rows, owner, events, pal, store):
                                   "(empty = the spoken line). Typing here on a caption line makes it an accent."),
          "Colour": st.column_config.SelectboxColumn(options=list(LABEL_TO_COLOUR), help="Accent colour (see the swatches)."),
          "Side": st.column_config.SelectboxColumn(options=SIDES, help="Accent: which side of the head."),
-         "Hard zoom": st.column_config.CheckboxColumn(help="Accent or quote: a strong punch-in.")},
+         "Hard zoom": st.column_config.CheckboxColumn(help="Accent or quote: a strong punch-in."),
+         t1.POP_COL: st.column_config.CheckboxColumn(help=t1.POP_COL_HELP)},
         disabled=["Time", "Line"])
-    if t1.grid_changed(edited, df, LINE_EDIT):
-        new_events, notes = apply_line_rows(words, groups, rows, owner, events, lines, edited.to_dict("records"))
-        store(new_events, ("⚠ " + " ".join(notes)) if notes else None)
+    if t1.grid_changed(edited, df, LINE_EDIT + [t1.POP_COL]):
+        recs = edited.to_dict("records")
+        new_events, notes = events, []
+        if t1.grid_changed(edited, df, LINE_EDIT):
+            new_events, notes = apply_line_rows(words, groups, rows, owner, events, lines, recs)
+        if t1.grid_changed(edited, df, [t1.POP_COL]):
+            new_events, n2 = t1.apply_pop_col(words, groups, new_events, lines, recs, is_accent)
+            notes += n2
+        store(new_events, ("⚠ " + " ".join(notes)) if notes else None, grid=edited)
 
 
 # ------------------------------------------------------------------ the step (UI)
@@ -514,28 +537,34 @@ def step(project_dir, project, A):
     st.markdown("#### 2 · Words")
     use_roman = s["romanize"]
     words = spoken_words(project, A, use_roman)
-    if "events" not in s:
-        save(events=suggest_events(project, A, use_roman, total))
+    if "events" not in s:  # starts as plain captions: you pick what pops out (or ask for a suggestion)
+        save(events=[])
         s = settings(project)
     events = s.get("events") or []
     rows, owner = plan_rows(words, events)
     rev_key = f"t2_grid_rev_{pid}"
     rev = st.session_state.get(rev_key, 0)
 
-    def store(new_events, note=None):
-        save(events=new_events)
-        st.session_state[rev_key] = rev + 1
+    def store(new_events, note=None, grid=None):
+        changed = new_events != events
+        if changed:
+            save(events=new_events)
+        if grid is None or not t1.grid_keep(f"t2_applied_{pid}", grid, changed):
+            st.session_state[rev_key] = rev + 1
         if note:
             st.session_state[f"t2_note_{pid}"] = note
         st.rerun()
 
-    c1, c2 = st.columns([3, 1])
+    c1, c2, c3 = st.columns([4, 1, 1])
     c1.caption("Every spoken word shows as a small caption unless you make it something else. In the grid, choose "
                "what each line shows as and type its **Pop words**, or **drag across the timeline** to select "
                "words. Changes are saved straight away and show in the live preview.")
-    if c2.button("↺ Suggest again", key=f"t2_sugg_{pid}", use_container_width=True,
-                 help="Replace the plan with a fresh suggestion."):
+    if c2.button("✨ Suggest for me", key=f"t2_sugg_{pid}", use_container_width=True,
+                 help="Replace the plan with a suggestion."):
         store(suggest_events(project, A, use_roman, total), "New suggestion made.")
+    if c3.button("⌫ All captions", key=f"t2_clear_{pid}", use_container_width=True,
+                 help="Every line back to a plain caption."):
+        store([], "All lines are plain captions now.")
     note = st.session_state.pop(f"t2_note_{pid}", None)
     if note:
         st.toast(note.lstrip("⚠ "), icon="⚠️" if note.startswith("⚠") else "✅")
@@ -574,6 +603,8 @@ def step(project_dir, project, A):
         _t2_grid(pid, rev, words, rows, owner, events, pal, store)
 
     # ---- more settings
+    t1.pop_controls(pid, "t2", s, save, "accent words")
+    s = settings(project)
     with st.expander("⚙ More settings: exact colours, frame, zoom, head position, jump cuts"):
         st.markdown("**Exact colours**")
         t1.custom_colours(pid, "t2", T2_FIELDS, pal, save)
@@ -685,9 +716,12 @@ def step(project_dir, project, A):
                 info.success("Preview is up to date with your current settings.")
 
     # ---- 4. render
-    st.markdown("#### 4 · Render")
-    st.caption("A 35 s video takes about 2-4 minutes.")
-    if st.button("Render Template 2 video", type="primary", key=f"t2_render_{pid}"):
+    st.markdown("#### 4 · Render or carry forward")
+    st.caption("Render the video now (about 2-4 minutes for 35 s), or carry it forward to the Visual hook page "
+               "and render it there once, with the hook.")
+    rc, cc = st.columns(2)
+    t1.carry_button(project_dir, project, A, "template2", cc)
+    if rc.button("Render Template 2 video", type="primary", key=f"t2_render_{pid}", use_container_width=True):
         try:
             with st.spinner("Rendering with Remotion..."):
                 out = render_video(project_dir, project, A)

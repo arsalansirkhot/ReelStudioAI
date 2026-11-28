@@ -57,7 +57,8 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 st.set_page_config(page_title="Reel Studio AI", page_icon="🎬", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""<style>
-.block-container{max-width:1200px;padding:1rem .9rem 4rem}
+.block-container{max-width:1880px;padding:1rem 2rem 4rem}
+@media (max-width:640px){.block-container{padding:1rem .9rem 4rem}}
 div[data-testid="stColumn"]:has(.sticky-preview){position:sticky;top:3.5rem;align-self:flex-start}
 h1{font-size:1.5rem!important} h2{font-size:1.25rem!important} h3{font-size:1.1rem!important}
 @media (max-width:640px){.stButton>button,.stDownloadButton>button{width:100%}}
@@ -76,6 +77,21 @@ try:
     import template2_preset
 except Exception:
     template2_preset = None
+# Template 3 add-on (vlog: voice-over + B-roll): template3_preset.py. It needs talking1_preset and template2_preset.
+try:
+    import template3_preset
+except Exception:
+    template3_preset = None
+# Visual hook add-on: visualhook_preset.py, an opening effect over a finished template video. Needs talking1_preset.
+try:
+    import visualhook_preset
+except Exception:
+    visualhook_preset = None
+# Outro add-on: outro_preset.py, a short end card after the video. Needs talking1_preset and visualhook_preset.
+try:
+    import outro_preset
+except Exception:
+    outro_preset = None
 # Clean-audio add-on: clean_audio_preset.py (DeepFilterNet background noise removal), shown as the first step.
 try:
     import clean_audio_preset
@@ -88,6 +104,12 @@ if talking1_preset:
     STEPS.append("Talking1 style")
 if talking1_preset and template2_preset:
     STEPS.append("Template 2")
+if talking1_preset and template2_preset and template3_preset:
+    STEPS.append("Template 3 · Vlog")
+if talking1_preset and visualhook_preset:
+    STEPS.append("Visual hook")
+if talking1_preset and visualhook_preset and outro_preset:
+    STEPS.append("Outro")
 if clean_audio_preset:  # Clean-audio add-on: first step, so every later step shifts by one
     STEPS.insert(0, "Clean audio")
     SUBS_IDX += 1
@@ -2945,6 +2967,12 @@ if talking1_preset:  # Talking1 add-on
     SECTIONS.append((lambda pdir_, pdata_: talking1_preset.step(pdir_, pdata_, globals()), None))
 if talking1_preset and template2_preset:  # Template 2 add-on
     SECTIONS.append((lambda pdir_, pdata_: template2_preset.step(pdir_, pdata_, globals()), None))
+if talking1_preset and template2_preset and template3_preset:  # Template 3 add-on
+    SECTIONS.append((lambda pdir_, pdata_: template3_preset.step(pdir_, pdata_, globals()), None))
+if talking1_preset and visualhook_preset:  # Visual hook add-on
+    SECTIONS.append((lambda pdir_, pdata_: visualhook_preset.step(pdir_, pdata_, globals()), None))
+if talking1_preset and visualhook_preset and outro_preset:  # Outro add-on
+    SECTIONS.append((lambda pdir_, pdata_: outro_preset.step(pdir_, pdata_, globals()), None))
 if clean_audio_preset:  # Clean-audio add-on: first step, with its own export / continue buttons
     SECTIONS.insert(0, (lambda pdir_, pdata_: clean_audio_preset.step(pdir_, pdata_, globals()), None))
 
